@@ -1,0 +1,96 @@
+diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
+index aff39301..21053662 100644
+--- a/ggml/src/ggml-cuda/hyperconn.cu
++++ b/ggml/src/ggml-cuda/hyperconn.cu
+@@ -418,8 +418,16 @@ __device__ __forceinline__ uint32_t hc_pack2(const float a, const float b) {
+     return (uint32_t) hc_f2bf32(a) | ((uint32_t) hc_f2bf32(b) << 16);
+ }
+ 
++// NT: non-temporal stores, so a big batch's outputs go to memory instead of leaving the caches full of dirty lines
++// that the next kernel has to write back
++template <bool NT>
++__device__ __forceinline__ void hc_store2(uint16_t * p, const float a, const float b) {
++    if constexpr (NT) __builtin_nontemporal_store(hc_pack2(a, b), (uint32_t *) p);
++    else              *(uint32_t *) p = hc_pack2(a, b);
++}
++
+ // One (token, stream) row of the combine + norm; with INJECT it also accumulates the row's share of the next mix's inject projection.
+-template <bool INJECT>
++template <bool INJECT, bool NT>
+ static __device__ __forceinline__ void hc_combine_norm_row_b256(
+         const int c, const int t, const int hc, float * s_sum,
+         const float * inject, const float * residual,
+@@ -454,7 +462,7 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
+             else       { const float2   v = *(const float2 *)(blk + col);     m0 = v.x;      m1 = v.y; }
+             const float a0 = hc_add_rn(r0, hc_mul_rn(m0, w));
+             const float a1 = hc_add_rn(r1, hc_mul_rn(m1, w));
+-            if (dst16) *(uint32_t *)(dst16 + col) = hc_pack2(a0, a1);
++            if (dst16) hc_store2<NT>(dst16 + col, a0, a1);
+             else       *(float2 *)(dst + col)     = make_float2(a0, a1);
+             xs[2 * k] = a0; xs[2 * k + 1] = a1;
+             tmp += a0 * a0 + a1 * a1;
+@@ -484,7 +492,7 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
+                 // a half warp holds 32 consecutive values as pairs (n_embd % 64 == 0, so whole warps are in range)
+                 quantize_q8_1_pairs(v0, v1, q8 + (row * n_embd + col) / QK8_1, tid % 16);
+             }
+-            if (xh) *(uint32_t *)(xh + col) = hc_pack2(v0, v1);
++            if (xh) hc_store2<NT>(xh + col, v0, v1);
+             if constexpr (INJECT) {
+ #pragma unroll
+                 for (int r = 0; r < HC_INJ_HC; ++r) {
+@@ -506,6 +514,7 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
+     }
+ }
+ 
++template <bool NT>
+ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b256(
+         const float * inject, const float * residual,
+         const float * block_out, const float * gamma,
+@@ -513,12 +522,13 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
+         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
+         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps, block_q8_1 * q8) {
+     __shared__ float s_sum[32];
+-    hc_combine_norm_row_b256<false>(blockIdx.x, blockIdx.y, gridDim.x, s_sum, inject, residual, block_out, gamma,
++    hc_combine_norm_row_b256<false, NT>(blockIdx.x, blockIdx.y, gridDim.x, s_sum, inject, residual, block_out, gamma,
+         out_res, out_xn, out_xn_bf16, store_xn_f32, res_in_bf16, res_out_bf16, blk_in_bf16,
+         n_embd, s1, b1, s2, b2, eps, nullptr, nullptr, q8);
+ }
+ 
+ // One block per token over all HC_INJ_HC streams: the rows of hc_combine_norm_f32_b256 plus the next mix's inject projection.
++template <bool NT>
+ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 2) hc_combine_norm_inject_f32_b256(
+         const float * inject, const float * residual,
+         const float * block_out, const float * gamma,
+@@ -532,7 +542,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 2) hc_combine_norm_inject
+     float inj[HC_INJ_HC] = {};
+ #pragma unroll
+     for (int c = 0; c < HC_INJ_HC; ++c) {
+-        hc_combine_norm_row_b256<true>(c, t, HC_INJ_HC, s_sum[c], inject, residual, block_out, gamma,
++        hc_combine_norm_row_b256<true, NT>(c, t, HC_INJ_HC, s_sum[c], inject, residual, block_out, gamma,
+             out_res, out_xn, out_xn_bf16, store_xn_f32, res_in_bf16, res_out_bf16, blk_in_bf16,
+             n_embd, s1, b1, s2, b2, eps, w_inj, inj);
+     }
+@@ -585,11 +595,13 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
+         return;
+     }
+ 
++    // batches whose outputs outgrow the caches (prompt ubatches) store them non-temporally
++    const bool nt = n_tokens >= 1024;
+     if (a.out_inject) {
+         GGML_ASSERT(hc == HC_INJ_HC && a.w_inject && ggml_nelements(a.out_inject) == hc * n_tokens &&
+                     a.w_inject->ne[0] == n_embd * hc && a.w_inject->ne[1] == hc);
+         const ggml_cuda_kernel_launch_params lpi(dim3((int) n_tokens, 1, 1), HC_CN_BLOCK2, 0, ctx.stream());
+-        ggml_cuda_kernel_launch(hc_combine_norm_inject_f32_b256, lpi,
++        ggml_cuda_kernel_launch(nt ? hc_combine_norm_inject_f32_b256<true> : hc_combine_norm_inject_f32_b256<false>, lpi,
+             (const float *) a.inject->data, (const float *) a.residual->data,
+             (const float *) a.block_out->data, (const float *) a.gamma->data,
+             (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
+@@ -601,7 +613,7 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
+ 
+     // 256 threads x 2 packed elements per iteration (the shipped layout); the BF16 options ride on this kernel
+     const ggml_cuda_kernel_launch_params lp2(dim3((int) hc, (int) n_tokens, 1), HC_CN_BLOCK2, 0, ctx.stream());
+-    ggml_cuda_kernel_launch(hc_combine_norm_f32_b256, lp2,
++    ggml_cuda_kernel_launch(nt ? hc_combine_norm_f32_b256<true> : hc_combine_norm_f32_b256<false>, lp2,
+         (const float *) a.inject->data, (const float *) a.residual->data,
+         (const float *) a.block_out->data, (const float *) a.gamma->data,
+         (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,

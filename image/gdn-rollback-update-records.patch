@@ -1,0 +1,239 @@
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 90b8459..3bbe597 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1234,6 +1234,82 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
+     };
+ }
+ 
++// Rollback slots of a multi-token decode step: the state after its first token is stored in full, the state after a
++// later token t as the record of its update (the state is fma(g, s, k[row] * delta[col]) of the one before:
++// [mark | t, g, k[S], delta[S], cache row] in place of the head's S*S values), replayed by the reader from the full state
++// t slots further. One state write per step instead of one per token; the replay repeats the same fmaf on the same
++// values (bit-identical). The mark is a NaN pattern, which a state never holds. Only with a single-sequence cache, so a
++// record is never copied to another sequence's row.
++#define GDN_RS_MARK      0x7fd1e700u
++#define GDN_RS_MARK_MASK 0xffffff00u
++
++// a warp's state shard of one head (columns colw.., rows r * warp_size + lane), replaying an update record if there is one
++template <int S, int warp_size, int cols_per_warp, int rows_per_lane>
++static __device__ __forceinline__ void gdn_rs_load(float (&s)[cols_per_warp][rows_per_lane], const float * state_in,
++        const int64_t slot_stride, const int colw, const int lane) {
++    const uint32_t mark = __float_as_uint(state_in[0]);
++    const int      tr   = (mark & GDN_RS_MARK_MASK) == GDN_RS_MARK ? (int) (mark & ~GDN_RS_MARK_MASK) : 0;
++    const float *  base = state_in + tr * slot_stride;
++#pragma unroll
++    for (int c = 0; c < cols_per_warp; c++) {
++#pragma unroll
++        for (int r = 0; r < rows_per_lane; r++) {
++            s[c][r] = base[(colw + c) * S + r * warp_size + lane];
++        }
++    }
++    for (int j = 1; j <= tr; ++j) {
++        const float * rec = state_in + (tr - j) * slot_stride;
++        const float   g   = rec[1];
++        float k[rows_per_lane];
++#pragma unroll
++        for (int r = 0; r < rows_per_lane; r++) {
++            k[r] = rec[2 + r * warp_size + lane];
++        }
++#pragma unroll
++        for (int c = 0; c < cols_per_warp; c++) {
++            const float d = rec[2 + S + colw + c];
++#pragma unroll
++            for (int r = 0; r < rows_per_lane; r++) {
++                s[c][r] = fmaf(g, s[c][r], k[r] * d);
++            }
++        }
++    }
++}
++
++// states gathered from the cache by get_rows, or cache rows in place: replace an update record by the state it stands for
++template <int S>
++__global__ void __launch_bounds__(32 * 16, 1)
++gdn_rs_materialize_cuda(float * state, const float * cache, const int64_t row_stride, const int64_t slot_stride, const int H) {
++    constexpr int warp_size = 32;
++    constexpr int nwarps    = 16;
++    constexpr int rows_per_lane = S / warp_size;
++    constexpr int cols_per_warp = S / nwarps;
++    const int h    = blockIdx.x;
++    const int seq  = blockIdx.y;
++    const int lane = threadIdx.x;
++    const int colw = threadIdx.y * cols_per_warp;
++    float * st = state + ((int64_t) seq * H + h) * S * S;
++    if ((__float_as_uint(st[0]) & GDN_RS_MARK_MASK) != GDN_RS_MARK) {
++        return;
++    }
++    const float * state_in = cache + (int64_t) __float_as_int(st[2 + 2 * S]) * row_stride + (int64_t) h * S * S;
++    float s[cols_per_warp][rows_per_lane];
++    gdn_rs_load<S, warp_size>(s, state_in, slot_stride, colw, lane);
++    __syncthreads(); // in place, the record is read before it is overwritten
++#pragma unroll
++    for (int c = 0; c < cols_per_warp; c++) {
++#pragma unroll
++        for (int r = 0; r < rows_per_lane; r++) {
++            st[(colw + c) * S + r * warp_size + lane] = s[c][r];
++        }
++    }
++}
++
++void ggml_cuda_gdn_rs_materialize(float * cache, int64_t row0, int64_t n_rows, int64_t row_stride, int64_t plane_rows, cudaStream_t stream) {
++    const int H = (int) (row_stride / (128 * 128));
++    gdn_rs_materialize_cuda<128><<<dim3(H, n_rows), dim3(32, 16), 0, stream>>>(cache + row0 * row_stride, cache, row_stride, row_stride * plane_rows, H);
++}
++
+ static void ggml_cuda_op_gated_delta_net_impl(
+         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
+     // q/k-norm fusion: the normalized q/k were never computed; read the raw views and normalize in the chunk kernels
+@@ -1330,6 +1406,17 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     const int K = ggml_get_op_params_i32(dst, 0);
+     const bool keep_rs = K > 1;
+ 
++    // a state gathered from the cache may be an update record of the fused decode (see gdn_rs_load)
++    if (const ggml_tensor * gr = src_state->view_src; K > 1 && S_v == 128 && gr && gr->op == GGML_OP_GET_ROWS && src_state->view_offs == 0) {
++        const ggml_tensor * cache      = gr->src[0];
++        const int64_t       row_stride = S_v * S_v * H;
++        const int64_t       n_rows     = ggml_nelements(cache) / row_stride;
++        if (cache->type == GGML_TYPE_F32 && cache->ne[0] == row_stride && n_rows % K == 0) {
++            gdn_rs_materialize_cuda<128><<<dim3(H, n_seqs), dim3(32, 16), 0, stream>>>((float *) src_state->data,
++                (const float *) cache->data, row_stride, row_stride * (n_rows / K), (int) H);
++        }
++    }
++
+     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
+     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
+     int64_t state_slot_stride = S_v * S_v * H * n_seqs;
+@@ -1500,14 +1587,7 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+     float s_shard[cols_per_warp][rows_per_lane];
+     {
+         const float * state_in = args.state_cache + (int64_t) args.state_ids[0] * args.state_row_stride + (int64_t) h * S * S;
+-        const int     colw     = warp * cols_per_warp;
+-#pragma unroll
+-        for (int c = 0; c < cols_per_warp; c++) {
+-#pragma unroll
+-            for (int r = 0; r < rows_per_lane; r++) {
+-                s_shard[c][r] = state_in[(colw + c) * S + r * warp_size + lane];
+-            }
+-        }
++        gdn_rs_load<S, warp_size>(s_shard, state_in, args.state_slot_stride, warp * cols_per_warp, lane);
+     }
+ 
+     for (int t = 0; t < args.n_tokens; ++t) {
+@@ -1616,6 +1696,8 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+     {
+         float *       state_out = args.state_out + slot * args.state_slot_stride + (int64_t) h * S * S;
+         const int     colw      = warp * cols_per_warp;
++        // after the first token, with a single-sequence cache: update record (see gdn_rs_load)
++        const bool    rec_slot  = t > 0 && args.state_slot_stride == args.state_row_stride;
+ 
+         float k_reg[rows_per_lane];
+         float q_reg[rows_per_lane];
+@@ -1637,6 +1719,9 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+             const float kv_col = gdn_warp_reduce_sum<warp_size>(kv_shard);
+ 
+             const float delta_col = fmaf(-g_val, kv_col, v_c[colw + c]) * beta_val;
++            if (rec_slot && lane == 0) {
++                state_out[2 + S + colw + c] = delta_col;
++            }
+ 
+             float attn_partial = 0.0f;
+ #pragma unroll
+@@ -1658,11 +1743,22 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+ 
+         // non-temporal: written once per token (rollback slots) and read at the earliest by the next pass, so caching
+         // them only leaves dirty lines that the following kernels pay to write back
++        if (rec_slot) {
++            if (thread == 0) {
++                state_out[0]         = __uint_as_float(GDN_RS_MARK | (uint32_t) t);
++                state_out[1]         = g_val;
++                state_out[2 + 2 * S] = __int_as_float((int) ((state_out - h * S * S - args.state_cache) / args.state_row_stride));
++            }
++            if (thread < S) {
++                state_out[2 + thread] = k_n[thread];
++            }
++        } else {
+ #pragma unroll
+-        for (int c = 0; c < cols_per_warp; c++) {
++            for (int c = 0; c < cols_per_warp; c++) {
+ #pragma unroll
+-            for (int r = 0; r < rows_per_lane; r++) {
+-                __builtin_nontemporal_store(s_shard[c][r], &state_out[(colw + c) * S + r * warp_size + lane]);
++                for (int r = 0; r < rows_per_lane; r++) {
++                    __builtin_nontemporal_store(s_shard[c][r], &state_out[(colw + c) * S + r * warp_size + lane]);
++                }
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index 8ec4889..28111e4 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -9,6 +9,9 @@ struct ggml_cuda_gated_delta_net_fused_cache {
+ 
+ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++// replace the update records (see gdn_rs_load) among rows [row0, row0 + n_rows) of a GDN state cache by their states
++void ggml_cuda_gdn_rs_materialize(float * cache, int64_t row0, int64_t n_rows, int64_t row_stride, int64_t plane_rows, cudaStream_t stream);
++
+ // Chunked prefill (RDNA3.5): the q/k L2 norms that precede GATED_DELTA_NET (RMS_NORM(x, eps/n) -> SCALE(1/sqrt(n)),
+ // i.e. x * mul * rsqrt(sum(x^2) + eps) per 128-row) are folded into the chunk kernels. ggml_cuda_gdn_chunk_eligible
+ // is the exact dispatch condition of the chunked path for this GDN node with these q/k tensors; set_qk_norm registers
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 16d96d6..64a7620 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -9000,8 +9000,22 @@ static void ggml_backend_cuda_set_mmb_small_batch(ggml_backend_t backend, bool e
+     ((ggml_backend_cuda_context *) backend->context)->mmb_small_batch = enable;
+ }
+ 
++// before llama saves rows of a recurrent state cache with n_planes rollback planes (see gdn_rs_load)
++static void ggml_backend_cuda_gdn_rs_materialize(ggml_tensor * cache, int64_t row0, int64_t n_rows, int64_t n_planes) {
++    if (!ggml_backend_buffer_is_cuda(cache->buffer) || cache->type != GGML_TYPE_F32 || cache->ne[0] % (128 * 128) != 0 ||
++            cache->ne[1] % n_planes != 0) {
++        return;
++    }
++    ggml_cuda_set_device(((ggml_backend_cuda_buffer_context *) cache->buffer->context)->device);
++    ggml_cuda_gdn_rs_materialize((float *) cache->data, row0, n_rows, cache->ne[0], cache->ne[1] / n_planes, cudaStreamPerThread);
++    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++}
++
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
++    if (strcmp(name, "ggml_backend_cuda_gdn_rs_materialize") == 0) {
++        return (void *)ggml_backend_cuda_gdn_rs_materialize;
++    }
+     if (strcmp(name, "ggml_backend_cuda_set_mmb_enabled") == 0) {
+         return (void *)ggml_backend_cuda_set_mmb_enabled;
+     }
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 21ded10..039499c 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -926,6 +926,17 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
+     }
+ }
+ 
++// The CUDA fused GDN decode may store a rollback slot as an update record (gated_delta_net.cu, gdn_rs_load): saved
++// rows must hold the states themselves
++static void rs_materialize(ggml_tensor * s, uint32_t row0, uint32_t n_rows, uint32_t n_planes) {
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(s->buffer));
++    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++    auto * fn = reg ? (void (*)(ggml_tensor *, int64_t, int64_t, int64_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gdn_rs_materialize") : nullptr;
++    if (fn) {
++        fn(s, row0, n_rows, n_planes);
++    }
++}
++
+ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+     const uint32_t s_trans = 0;
+     const uint32_t n_layer = hparams.n_layer();
+@@ -985,6 +996,9 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+             for (const auto & range : cell_ranges) {
+                 const size_t range_size = range.second - range.first;
+                 const size_t buf_size = range_size * s_size_row;
++                if (n_rs_seq > 0) {
++                    rs_materialize(s_l[il], range.first, range_size, 1 + n_rs_seq);
++                }
+                 io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+             }
+         }

@@ -1,0 +1,447 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 63312de0..1edb893f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6215,6 +6215,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 break;
+             }
+ 
++#if defined(GGML_USE_HIP)
++            if (op == GGML_OP_MUL_MAT && ggml_cuda_mmvq_columns_glu_supported(up, gate, glu)) {
++                ggml_cuda_mm_fusion_args_host fusion_data{};
++                fusion_data.gate   = gate->src[0];
++                fusion_data.glu_op = ggml_get_glu_op(glu);
++                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                fused_mul_mat_vec = true;
++                fused_node_count  = 3;
++                break;
++            }
++#endif // defined(GGML_USE_HIP)
++
+             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate->src[0];
+@@ -6707,6 +6719,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 1;
+     }
+ 
++#if defined(GGML_USE_HIP)
++    // consecutive Q8_0 MUL_MATs of 2..4 columns reading the same activations (view/no-op nodes in between): one launch
++    if (node->op == GGML_OP_MUL_MAT && node->ne[1] >= 2 && node->ne[1] <= 4 && cuda_ctx->stream_context().concurrent_events.empty()) {
++        ggml_tensor * group[4] = { node };
++        int n = 1, last = i;
++        for (int j = i + 1; j < cgraph->n_nodes && n < 4; ++j) {
++            ggml_tensor * t = cgraph->nodes[j];
++            if (ggml_cuda_is_view_or_noop(t)) {
++                continue;
++            }
++            if (t->op != GGML_OP_MUL_MAT || t->src[1] != node->src[1] || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
++                    t->src[0]->type != node->src[0]->type || (t->src[0]->ne[1] < 512) != (node->src[0]->ne[1] < 512)) {
++                break;
++            }
++            group[n++] = t;
++            last = j;
++        }
++        if (n > 1 && ggml_cuda_mul_mat_vec_q8_0_columns_group(*cuda_ctx, group, n)) {
++            return last - i;
++        }
++    }
++#endif // defined(GGML_USE_HIP)
++
+     return 0;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 7daa06cf..c6761f8d 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -703,18 +703,41 @@ static __global__ void mul_mat_vec_q4_columns(
+ // exact kernels bound by the texture-address unit on small matrices. Here each lane reads 16 weight bytes and
+ // 16 activation bytes per column with single loads (unaligned loads are fine on AMD), and matrices with few
+ // rows split K over c_nwarps warps.
+-template <int c_ncols, int c_nwarps>
++// up to 4 matrices with the same activations in one launch: block rows [row_end[m-1], row_end[m]) belong to matrix m
++struct mmvq_q8_0_columns_group {
++    const void * x[4];
++    float *      dst[4];
++    uint32_t     row_end[4];
++    uint32_t     stride_row_x[4];
++    uint32_t     stride_col_dst[4];
++};
++
++// has_gate: vgate_ptr holds the gate rows of a SwiGLU pair, dst = silu(gate) * x (the GLU of the two products)
++// c_group: the matrices, rows and destinations come from grp (one channel and sample)
++template <int c_ncols, int c_nwarps, bool has_gate = false, bool c_group = false>
+ __launch_bounds__(c_nwarps * ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q8_0_columns_rdna3_5(
+-        const void * vx_ptr, const void * vy_ptr, float * dst_ptr,
+-        const uint32_t ncols_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
+-        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
++        const void * vx_ptr, const void * vgate_ptr, const void * vy_ptr, float * dst_ptr,
++        const uint32_t ncols_x, uint32_t stride_row_x, const uint32_t stride_col_y,
++        uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+-        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
++        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
++        const mmvq_q8_0_columns_group grp) {
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+     constexpr int blocks_per_iter = c_nwarps * warp_size / 2;
+ 
+-    const int row  = blockIdx.x;
++    int row = blockIdx.x;
++    if constexpr (c_group) {
++        int m = 0;
++        while (m < 3 && row >= (int) grp.row_end[m]) {
++            ++m;
++        }
++        row -= m > 0 ? grp.row_end[m - 1] : 0;
++        vx_ptr         = grp.x[m];
++        dst_ptr        = grp.dst[m];
++        stride_row_x   = grp.stride_row_x[m];
++        stride_col_dst = grp.stride_col_dst[m];
++    }
+     const int lane = threadIdx.x;
+     const int half = lane % 2;
+     const uint32_t channel_dst = blockIdx.y;
+@@ -722,38 +745,56 @@ static __global__ void mul_mat_vec_q8_0_columns_rdna3_5(
+     const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
+     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+ 
+-    const block_q8_0 * x = (const block_q8_0 *) vx_ptr + sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
++    const int64_t x_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
++    const block_q8_0 * x = (const block_q8_0 *) vx_ptr + x_offset;
++    const block_q8_0 * g = has_gate ? (const block_q8_0 *) vgate_ptr + x_offset : nullptr;
+     const block_q8_1 * y = (const block_q8_1 *) vy_ptr + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
+     float * dst = dst_ptr + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row;
+ 
++    constexpr int n_mat = has_gate ? 2 : 1;
+     const int blocks_per_row_x = ncols_x / QK8_0;
+-    float tmp[c_ncols] = {0.0f};
++    float tmp[n_mat][c_ncols] = {{0.0f}};
+ 
+     for (int kb = threadIdx.y*(warp_size/2) + lane/2; kb < blocks_per_row_x; kb += blocks_per_iter) {
+-        const int4  xv = *(const int4 *) (x[kb].qs + 16*half);
+-        const float dx = __half2float(x[kb].d);
++        int4  xv[n_mat];
++        float dx[n_mat];
++#pragma unroll
++        for (int m = 0; m < n_mat; ++m) {
++            const block_q8_0 * w = m == 0 ? x : g;
++            xv[m] = *(const int4 *) (w[kb].qs + 16*half);
++            dx[m] = __half2float(w[kb].d);
++        }
+ #pragma unroll
+         for (int j = 0; j < c_ncols; ++j) {
+             const block_q8_1 * by = &y[j*stride_col_y + kb];
+             const int4 yv = *(const int4 *) (by->qs + 16*half);
+-            int sumi = ggml_cuda_dp4a(xv.x, yv.x, 0);
+-            sumi = ggml_cuda_dp4a(xv.y, yv.y, sumi);
+-            sumi = ggml_cuda_dp4a(xv.z, yv.z, sumi);
+-            sumi = ggml_cuda_dp4a(xv.w, yv.w, sumi);
+-            tmp[j] += dx * __low2float(by->ds) * (float) sumi;
++#pragma unroll
++            for (int m = 0; m < n_mat; ++m) {
++                int sumi = ggml_cuda_dp4a(xv[m].x, yv.x, 0);
++                sumi = ggml_cuda_dp4a(xv[m].y, yv.y, sumi);
++                sumi = ggml_cuda_dp4a(xv[m].z, yv.z, sumi);
++                sumi = ggml_cuda_dp4a(xv[m].w, yv.w, sumi);
++                tmp[m][j] += dx[m] * __low2float(by->ds) * (float) sumi;
++            }
+         }
+     }
+ 
+ #pragma unroll
+-    for (int j = 0; j < c_ncols; ++j) {
+-        tmp[j] = warp_reduce_sum<warp_size>(tmp[j]);
++    for (int m = 0; m < n_mat; ++m) {
++#pragma unroll
++        for (int j = 0; j < c_ncols; ++j) {
++            tmp[m][j] = warp_reduce_sum<warp_size>(tmp[m][j]);
++        }
+     }
+     if constexpr (c_nwarps > 1) {
+-        __shared__ float s_sum[c_nwarps][c_ncols];
++        __shared__ float s_sum[c_nwarps][n_mat][c_ncols];
+         if (lane == 0) {
+ #pragma unroll
+-            for (int j = 0; j < c_ncols; ++j) {
+-                s_sum[threadIdx.y][j] = tmp[j];
++            for (int m = 0; m < n_mat; ++m) {
++#pragma unroll
++                for (int j = 0; j < c_ncols; ++j) {
++                    s_sum[threadIdx.y][m][j] = tmp[m][j];
++                }
+             }
+         }
+         __syncthreads();
+@@ -761,25 +802,41 @@ static __global__ void mul_mat_vec_q8_0_columns_rdna3_5(
+             return;
+         }
+ #pragma unroll
+-        for (int j = 0; j < c_ncols; ++j) {
+-            tmp[j] = 0.0f;
++        for (int m = 0; m < n_mat; ++m) {
++#pragma unroll
++            for (int j = 0; j < c_ncols; ++j) {
++                tmp[m][j] = 0.0f;
+ #pragma unroll
+-            for (int w = 0; w < c_nwarps; ++w) {
+-                tmp[j] += s_sum[w][j];
++                for (int w = 0; w < c_nwarps; ++w) {
++                    tmp[m][j] += s_sum[w][m][j];
++                }
+             }
+         }
+     }
+     if (lane == 0) {
+ #pragma unroll
+         for (int j = 0; j < c_ncols; ++j) {
+-            dst[j*stride_col_dst] = tmp[j];
++            dst[j*stride_col_dst] = has_gate ? ggml_cuda_op_silu_single(tmp[1][j]) * tmp[0][j] : tmp[0][j];
+         }
+     }
+ }
+ 
++// kernel variant for 2..4 columns, with K split over 4 warps or not
++template <bool has_gate, bool c_group, typename F>
++static void mmvq_q8_0_columns_dispatch(const int64_t ncols_dst, const bool split_k, const F & launch) {
++    switch (ncols_dst) {
++        case 2:  split_k ? launch(mul_mat_vec_q8_0_columns_rdna3_5<2, 4, has_gate, c_group>)
++                         : launch(mul_mat_vec_q8_0_columns_rdna3_5<2, 1, has_gate, c_group>); break;
++        case 3:  split_k ? launch(mul_mat_vec_q8_0_columns_rdna3_5<3, 4, has_gate, c_group>)
++                         : launch(mul_mat_vec_q8_0_columns_rdna3_5<3, 1, has_gate, c_group>); break;
++        default: split_k ? launch(mul_mat_vec_q8_0_columns_rdna3_5<4, 4, has_gate, c_group>)
++                         : launch(mul_mat_vec_q8_0_columns_rdna3_5<4, 1, has_gate, c_group>); break;
++    }
++}
++
+ // returns false if the batch is not handled here
+ static bool mul_mat_vec_q8_0_columns(
+-        const void * vx, const void * vy, float * dst, const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_dst,
++        const void * vx, const void * vgate, const void * vy, float * dst, const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_dst,
+         const int64_t stride_row_x, const int64_t stride_col_y, const int64_t stride_col_dst,
+         const int64_t nchannels_x, const int64_t nchannels_dst, const int64_t stride_channel_x, const int64_t stride_channel_y,
+         const int64_t stride_channel_dst, const int64_t nsamples_x, const int64_t nsamples_dst, const int64_t stride_sample_x,
+@@ -795,15 +852,84 @@ static bool mul_mat_vec_q8_0_columns(
+     const uint3 channel_ratio = init_fastdiv_values(nchannels_dst / nchannels_x);
+     const uint3 sample_ratio  = init_fastdiv_values(nsamples_dst / nsamples_x);
+     const auto launch = [&](auto kernel) {
+-        kernel<<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, stride_row_x, stride_col_y, stride_col_dst,
++        kernel<<<block_nums, block_dims, 0, stream>>>(vx, vgate, vy, dst, ncols_x, stride_row_x, stride_col_y, stride_col_dst,
+             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
++            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, mmvq_q8_0_columns_group{});
+     };
+-    switch (ncols_dst) {
+-        case 2:  split_k ? launch(mul_mat_vec_q8_0_columns_rdna3_5<2, 4>) : launch(mul_mat_vec_q8_0_columns_rdna3_5<2, 1>); break;
+-        case 3:  split_k ? launch(mul_mat_vec_q8_0_columns_rdna3_5<3, 4>) : launch(mul_mat_vec_q8_0_columns_rdna3_5<3, 1>); break;
+-        default: split_k ? launch(mul_mat_vec_q8_0_columns_rdna3_5<4, 4>) : launch(mul_mat_vec_q8_0_columns_rdna3_5<4, 1>); break;
++    vgate ? mmvq_q8_0_columns_dispatch<true,  false>(ncols_dst, split_k, launch)
++          : mmvq_q8_0_columns_dispatch<false, false>(ncols_dst, split_k, launch);
++    return true;
++}
++
++// SwiGLU of two Q8_0 products with 2..4 columns in one launch (see mul_mat_vec_q8_0_columns_rdna3_5), same sums as two
++// unfused calls
++bool ggml_cuda_mmvq_columns_glu_supported(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
++    const auto & info = ggml_cuda_info().devices[ggml_cuda_get_device()];
++    const ggml_tensor * w = up->src[0];
++    return GGML_CUDA_CC_IS_RDNA3_5(info.cc) && info.warp_size == 32 && up->op == GGML_OP_MUL_MAT && gate->op == GGML_OP_MUL_MAT &&
++        w->type == GGML_TYPE_Q8_0 && gate->src[0]->type == GGML_TYPE_Q8_0 && ggml_are_same_stride(w, gate->src[0]) &&
++        ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) &&
++        up->src[1]->type == GGML_TYPE_F32 && up->ne[1] >= 2 && up->ne[1] <= 4 && up->ne[2] == 1 && up->ne[3] == 1 &&
++        ggml_get_op_params_i32(up, 1) != GGML_HINT_EXACT_BATCH && ggml_get_op_params_i32(gate, 1) != GGML_HINT_EXACT_BATCH &&
++        !(ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE);
++}
++
++// Q8_0 MUL_MATs of 2..4 columns that read the same activations: one quantization and one launch, each matrix summed
++// as in its own mul_mat_vec_q8_0_columns call
++bool ggml_cuda_mul_mat_vec_q8_0_columns_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, const int n) {
++    const auto & info = ggml_cuda_info().devices[ggml_cuda_get_device()];
++    const ggml_tensor * src1 = mm[0]->src[1];
++    if (!GGML_CUDA_CC_IS_RDNA3_5(info.cc) || info.warp_size != 32 || n < 2 || n > 4 || src1->type != GGML_TYPE_F32 ||
++            src1->ne[1] < 2 || src1->ne[1] > 4 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->nb[0] != sizeof(float)) {
++        return false;
++    }
++    bool split_k = false;
++    for (int k = 0; k < n; ++k) {
++        const ggml_tensor * t = mm[k];
++        const ggml_tensor * w = t->src[0];
++        if (t->op != GGML_OP_MUL_MAT || t->src[1] != src1 || w->type != GGML_TYPE_Q8_0 || w->ne[0] != src1->ne[0] ||
++                w->ne[2] != 1 || w->ne[3] != 1 || w->nb[0] != ggml_type_size(w->type) ||
++                ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
++                t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || t->ne[1] != src1->ne[1] ||
++                ggml_get_op_params_i32(t, 1) == GGML_HINT_EXACT_BATCH) {
++            return false;
++        }
++        const bool sk = w->ne[1] < 512; // mul_mat_vec_q8_0_columns
++        if (k > 0 && sk != split_k) {
++            return false;
++        }
++        split_k = sk;
++    }
++
++    cudaStream_t stream = ctx.stream();
++    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1];
++    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
++    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
++    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), GGML_TYPE_Q8_0, ne10, src1->nb[1]/sizeof(float),
++        src1->nb[2]/sizeof(float), src1->nb[3]/sizeof(float), ne10_padded, ne11, 1, 1, stream);
++
++    mmvq_q8_0_columns_group grp{};
++    uint32_t rows = 0;
++    for (int k = 0; k < n; ++k) {
++        rows += mm[k]->src[0]->ne[1];
++        grp.x[k]              = mm[k]->src[0]->data;
++        grp.dst[k]            = (float *) mm[k]->data;
++        grp.row_end[k]        = rows;
++        grp.stride_row_x[k]   = mm[k]->src[0]->nb[1] / ggml_type_size(GGML_TYPE_Q8_0);
++        grp.stride_col_dst[k] = mm[k]->nb[1] / sizeof(float);
+     }
++    for (int k = n; k < 4; ++k) {
++        grp.row_end[k] = rows;
++    }
++
++    const dim3 block_nums(rows, 1, 1);
++    const dim3 block_dims(32, split_k ? 4 : 1, 1);
++    const uint3 one = init_fastdiv_values(1);
++    const auto launch = [&](auto kernel) {
++        kernel<<<block_nums, block_dims, 0, stream>>>(nullptr, nullptr, src1_q8_1.get(), nullptr, ne10, 0, ne10_padded / QK8_1, 0,
++            one, 0, 0, 0, one, 0, 0, 0, grp);
++    };
++    mmvq_q8_0_columns_dispatch<false, true>(ne11, split_k, launch);
+     return true;
+ }
+ #endif // defined(GGML_USE_HIP)
+@@ -3858,7 +3984,7 @@ void ggml_cuda_mul_mat_vec_q(
+     if (fusion) {
+         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
+-        GGML_ASSERT(  ids || dst->ne[1] == 1);
++        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->gate && src0->type == GGML_TYPE_Q8_0 && dst->ne[1] <= 4));
+         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
+         // non-negligible for some models such as gpt-oss-20b
+         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
+@@ -3962,8 +4088,12 @@ void ggml_cuda_mul_mat_vec_q(
+     const bool exact_batch = ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH;
+     const bool no_fusion = fusion_local.gate == nullptr && fusion_local.x_bias == nullptr && fusion_local.gate_bias == nullptr &&
+         fusion_local.x_scale == nullptr && fusion_local.gate_scale == nullptr && fusion_local.shared_up == nullptr;
+-    if (src0->type == GGML_TYPE_Q8_0 && ids == nullptr && no_fusion && !exact_batch &&
+-            mul_mat_vec_q8_0_columns(src0->data, src1_q8_1.get(), dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
++    // a 2..4 column SwiGLU pair (ggml_cuda_mmvq_columns_glu_supported, checked by the caller; dst is the GLU node)
++    const bool glu_columns = !ids && ncols_dst > 1 && fusion_local.gate != nullptr && fusion_local.glu_op == GGML_GLU_OP_SWIGLU &&
++        fusion_local.x_bias == nullptr && fusion_local.gate_bias == nullptr && fusion_local.x_scale == nullptr &&
++        fusion_local.gate_scale == nullptr && fusion_local.shared_up == nullptr;
++    if (src0->type == GGML_TYPE_Q8_0 && ids == nullptr && (no_fusion || glu_columns) && !exact_batch &&
++            mul_mat_vec_q8_0_columns(src0->data, glu_columns ? fusion_local.gate : nullptr, src1_q8_1.get(), dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+                 ne02, nchannels_dst, s02, stride_channel_y, stride_channel_dst, ne03, ne3, s03, s13, s3, stream)) {
+         return;
+     }
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index c2d1da92..881d218d 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -11,6 +11,12 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+ 
++// RDNA3.5: up/gate are Q8_0 MUL_MATs with 2..4 columns whose SwiGLU (glu) one ggml_cuda_mul_mat_vec_q call can compute
++bool ggml_cuda_mmvq_columns_glu_supported(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu);
++
++// RDNA3.5: n (2..4) Q8_0 MUL_MATs of 2..4 columns with the same src1 in one launch; false if not handled
++bool ggml_cuda_mul_mat_vec_q8_0_columns_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n);
++
+ void ggml_cuda_op_mul_mat_vec_q(
+     ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+diff --git a/src/models/models.h b/src/models/models.h
+index 43f104c5..b4721b6d 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2616,7 +2616,8 @@ struct llama_model_qwen4exp : public llama_model_base {
+                             int * sections,
+                             int   il,
+                         int64_t   q_first = 0,
+-                    ggml_tensor ** tile_out_ids = nullptr);
++                    ggml_tensor ** tile_out_ids = nullptr,
++                           bool   kv_only = false);
+ 
+         // dense self-attention restricted to the cells that top_k names
+         ggml_tensor * build_attn_qsa(
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 53468ecb..d2db1a36 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -524,6 +524,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+             layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
+     cb(cur, "mtp_hc_attn_pre", il);
+ 
++    // a masked draft reads back no hidden state when no row is an output (the catch-up and prompt passes): only the
++    // cache writes of the attention block are needed then
++    if (n_outputs == 0 && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
++        build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il, 0, nullptr, /*kv_only*/ true);
++        ggml_build_forward_expand(gf, inp_out_ids);
++        return;
++    }
++
+     // sparse attention for the draft when its context carries an indexer cache (the sidecar ships the
+     // block's indexer projections and the trunk's compress ratio is inherited at load), else dense
+     cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il);
+@@ -1788,7 +1796,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+         int *                     sections,
+         int                       il,
+         int64_t                   q_first,
+-        ggml_tensor **            tile_out_ids) {
++        ggml_tensor **            tile_out_ids,
++        bool                      kv_only) {
+     const int64_t n_embd_head = hparams.n_embd_head_v();
+     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+ 
+@@ -1890,6 +1899,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+     cb(Kcur, "Kcur", il);
+     cb(Vcur, "Vcur", il);
+ 
++    if (kv_only) {
++        // the cache stores of build_attn/build_attn_qsa without the attention; the inputs of the unused selection
++        // still get set, so keep them allocated
++        if (inp->self_k_rot) {
++            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
++        }
++        if (inp->self_v_rot) {
++            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
++        }
++        ggml_build_forward_expand(gf, Vcur);
++        ggml_build_forward_expand(gf, Kcur);
++        ggml_build_forward_expand(gf, inp->mctx->cpy_k(ctx0, Kcur, inp->get_k_idxs(), il));
++        ggml_build_forward_expand(gf, inp->mctx->cpy_v(ctx0, Vcur, inp->get_v_idxs(), il));
++        if (top_k) {
++            for (auto & [r, qi] : qsa_inps) {
++                for (ggml_tensor * t : { qi->cell_blk, qi->blk_cells, qi->blk_pos, qi->bias, qi->tail_idxs }) {
++                    if (t) {
++                        ggml_build_forward_expand(gf, t);
++                    }
++                }
++            }
++        }
++        return nullptr;
++    }
++
+     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+ 
+     if (top_k) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index becdfad9..8b82329e 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4730,7 +4730,10 @@ private:
+ 
+             // verify and try to accept the draft
+             {
+-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
++                // the sampler is only restored with a checkpoint, which a rollback within the recurrent-state window never takes
++                const bool may_restore = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
++                common_sampler_ptr smpl_save(may_restore ? common_sampler_clone(slot.smpl.get()) : nullptr);
+ 
+                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));

@@ -1,0 +1,3 @@
+# Build-time only: the HIP runtime build generates headers with CppHeaderParser.
+CppHeaderParser==2.7.4 --hash=sha256:382b30416d95b0a5e8502b214810dcac2a56432917e2651447d3abe253e3cc42
+ply==3.11 --hash=sha256:096f9b8350b65ebd2fd1346b12452efe5b9607f7482813ffca50c22722a807ce --hash=sha256:00c7c1aaa88358b9c765b6d3000c6eec0ba42abca5351b095321aef446081da3

@@ -1,0 +1,98 @@
+--- a/ggml/src/ggml-cuda/mmb-quant.cuh
++++ b/ggml/src/ggml-cuda/mmb-quant.cuh
+@@ -93,6 +93,52 @@
+     }
+     r.dsc.x = *(const uint16_t *) &x->d; r.dsc.y = *(const uint16_t *)(x->scales); r.sc23.x = *(const uint16_t *)(x->scales + 2);
+ }
++// IQ3_S, one thread per (row, matrix, 32-weight sub-block): the 8 values d * {1, 3, ..., 15} (the only IQ3_S grid
++// values) are rounded to bf16 once per sub-block and then looked up per weight with v_perm (grid in LDS holds
++// g >> 1 per byte); signs XOR the bf16 sign bits. Same fp32 products and RNE as mmb_grid8_bf16 -> bit-identical.
++struct mmb_iq3s_rawT { mmb_us2 qs[8], sg[4], qh[2], dsc; uint16_t sc23; };
++__device__ __forceinline__ void mmb_iq3s_fetchT(const uint8_t * row, const int b, const int sub, mmb_iq3s_rawT & r) {
++    const block_iq3_s * x = (const block_iq3_s *) row + b;
++#pragma unroll
++    for (int s = 0; s < 4; ++s) {
++        const int ib = 2 * s + sub;
++        r.qs[2 * s].x = *(const uint16_t *)(x->qs + 8 * ib);     r.qs[2 * s].y = *(const uint16_t *)(x->qs + 8 * ib + 2);
++        r.qs[2 * s + 1].x = *(const uint16_t *)(x->qs + 8 * ib + 4); r.qs[2 * s + 1].y = *(const uint16_t *)(x->qs + 8 * ib + 6);
++        r.sg[s].x = *(const uint16_t *)(x->signs + 4 * ib); r.sg[s].y = *(const uint16_t *)(x->signs + 4 * ib + 2);
++    }
++    r.qh[0].x = *(const uint16_t *)(x->qh);     r.qh[0].y = *(const uint16_t *)(x->qh + 2);
++    r.qh[1].x = *(const uint16_t *)(x->qh + 4); r.qh[1].y = *(const uint16_t *)(x->qh + 6);
++    r.dsc.x = *(const uint16_t *) &x->d; r.dsc.y = *(const uint16_t *)(x->scales); r.sc23 = *(const uint16_t *)(x->scales + 2);
++}
++template <int s, int NIL>   // decode units il0 .. il0 + NIL - 1 (8 weights each) of the sub-block
++__device__ __forceinline__ void mmb_iq3s_storeT(const mmb_iq3s_rawT & r, const uint32_t * gidx, const int sub, const bool ok, const int il0, uint16_t * dst) {
++    const uint32_t qh = ((uint32_t) r.qh[s / 2][s & 1] >> 8 * sub) & 0xff;                      // qh[2s + sub]
++    const uint32_t sc = ((((uint32_t) (s < 2 ? r.dsc.y : r.sc23) >> 8 * (s & 1)) & 0xff) >> 4 * sub) & 0xf;
++    const float d = mmb_h2f(ok ? (uint16_t) r.dsc.x : (uint16_t) 0) * (1 + 2 * (int) sc);
++    auto rb = [](const float x) { const uint32_t u = __float_as_uint(x); return u + 0x7fffu + ((u >> 16) & 1u); };
++    uint32_t P[4];
++#pragma unroll
++    for (int v = 0; v < 4; ++v) P[v] = __builtin_amdgcn_perm(rb(d * (float) (4 * v + 3)), rb(d * (float) (4 * v + 1)), 0x07060302u);
++    const uint32_t L03 = __builtin_amdgcn_perm(P[1], P[0], 0x06040200u), H03 = __builtin_amdgcn_perm(P[1], P[0], 0x07050301u);
++    const uint32_t L47 = __builtin_amdgcn_perm(P[3], P[2], 0x06040200u), H47 = __builtin_amdgcn_perm(P[3], P[2], 0x07050301u);
++    const uint32_t q[2] = {__builtin_bit_cast(uint32_t, r.qs[2 * s]), __builtin_bit_cast(uint32_t, r.qs[2 * s + 1])};
++    const uint32_t sg = ok ? __builtin_bit_cast(uint32_t, r.sg[s]) : 0u;
++#pragma unroll
++    for (int ii = 0; ii < NIL; ++ii) {
++        const int il = il0 + ii;
++        uint32_t o[4];
++#pragma unroll
++        for (int k = 0; k < 2; ++k) {
++            const int e = 2 * il + k;   // grid entry: weights 4e .. 4e + 3 of the sub-block
++            const uint32_t idx = gidx[((q[e / 4] >> 8 * (e & 3)) & 0xff) | (((qh >> e) & 1u) << 8)];
++            const uint32_t n = (sg >> 4 * e) & 0xf;
++            const uint32_t lb = __builtin_amdgcn_perm(L47, L03, idx);
++            const uint32_t hb = __builtin_amdgcn_perm(H47, H03, idx) ^ (((n * 0x204081u) & 0x01010101u) << 7);
++            o[2 * k] = __builtin_amdgcn_perm(hb, lb, 0x05010400u); o[2 * k + 1] = __builtin_amdgcn_perm(hb, lb, 0x07030602u);
++        }
++        *(uint4 *)(dst + 8 * il) = make_uint4(o[0], o[1], o[2], o[3]);
++    }
++}
+ template <int s>
+ __device__ __forceinline__ void mmb_iq3s_pack4(const mmb_iq3s_raw4 & r, const int sub, uint32_t & w0, uint32_t & w1) {
+     const uint32_t qs = (s & 1) ? r.qs[s / 2].y : r.qs[s / 2].x, qh = (s & 1) ? r.qh[s / 2].y : r.qh[s / 2].x, sg = (s & 1) ? r.sg[s / 2].y : r.sg[s / 2].x;
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -420,9 +420,14 @@
+     constexpr int LBR = LB ? (BM * 8) / NT : 1;
+     typename LBT::raw lbg[LBR], lbu[LBR];
+     __shared__ typename LBT::grid_t lbgrid[LBT::N];
+-    if constexpr (LB) { for (int i = tid; i < LBT::N; i += NT) lbgrid[i] = LBT::entry(i); }
+     constexpr bool B4 = WTYPE == 32 + GGML_TYPE_IQ3_S;   // whole-block fetch (K % 256 == 0 for IQ3_S)
+-    mmb_iq3s_raw4 r4g[B4 ? LBR : 1], r4u[B4 ? LBR : 1];
++    constexpr int TPS = NT / (4 * BM);                   // threads per (row, matrix, 32-weight sub-block)
++    constexpr bool B4T = B4 && NT % (4 * BM) == 0 && (TPS == 1 || TPS == 2);   // decode with mmb_iq3s_storeT
++    const int tcomb = tid / TPS, tpart = tid % TPS;
++    if constexpr (B4T) { for (int i = tid; i < LBT::N; i += NT) lbgrid[i] = (LBT::entry(i) >> 1) & 0x07070707u; }
++    else if constexpr (LB) { for (int i = tid; i < LBT::N; i += NT) lbgrid[i] = LBT::entry(i); }
++    mmb_iq3s_raw4 r4g[B4 && !B4T ? LBR : 1], r4u[B4 && !B4T ? LBR : 1];
++    mmb_iq3s_rawT rT;
+     int weight_ks = 0;
+     auto load_regs = [&](const int ks) {
+         weight_ks = ks;
+@@ -465,6 +470,11 @@
+         }
+     };
+     auto fetch4 = [&](const int b) {
++        if constexpr (B4T) {
++            const int row = min(tcomb >> 2, a_rows - 1);
++            mmb_iq3s_fetchT(((tcomb >> 1) & 1 ? Wu : Wg) + (size_t)row * wrow_bytes, b, tcomb & 1, rT);
++            return;
++        }
+         const int l8 = tid & 7, sub = l8 & 1, il = l8 >> 1;
+ #pragma unroll
+         for (int r = 0; r < LBR; ++r) {
+@@ -476,7 +486,10 @@
+     auto store4 = [&](auto qs) {   // k-step qs of the fetched block: same (w0, w1) as LBT::pack -> same decode
+         constexpr int s = decltype(qs)::value;
+         const int l8 = tid & 7, sub = l8 & 1, il = l8 >> 1;
+-        if constexpr (B4) {
++        if constexpr (B4T) {
++            const int row = tcomb >> 2;
++            mmb_iq3s_storeT<s, 4 / TPS>(rT, lbgrid, tcomb & 1, row < a_rows, tpart * (4 / TPS), ((tcomb >> 1) & 1 ? Au : Ag) + row * MMB_LDS_STRIDE + 32 * (tcomb & 1));
++        } else if constexpr (B4) {
+ #pragma unroll
+             for (int r = 0; r < LBR; ++r) {
+                 const int row = (tid >> 3) + r * (NT / 8);

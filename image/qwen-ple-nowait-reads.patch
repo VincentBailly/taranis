@@ -1,0 +1,56 @@
+diff --git a/src/llama-ple-disk.cpp b/src/llama-ple-disk.cpp
+index da374f9d..87ec6520 100644
+--- a/src/llama-ple-disk.cpp
++++ b/src/llama-ple-disk.cpp
+@@ -19,6 +19,7 @@
+ #include <cerrno>
+ #include <fcntl.h>
+ #include <sys/mman.h>
++#include <sys/uio.h>
+ #include <unistd.h>
+ #endif
+ 
+@@ -45,6 +46,8 @@ struct llama_ple_disk::impl {
+     std::vector<uint32_t>                      runs;     // order[runs[u]..runs[u+1]) are the positions of distinct row u
+     std::vector<uint8_t>                       raw;      // [distinct rows, rs]
+     std::vector<std::pair<int32_t, uint32_t>>  misses;   // (row, index into raw)
++    std::vector<std::pair<int32_t, uint32_t>>  cold;     // misses not in the page cache, read by the pool
++    bool                                       nowait = true; // RWF_NOWAIT reads work on this file
+     float *                                    dst     = nullptr; // destination of the gather in progress
+     const uint8_t *                            src_full = nullptr; // preloaded table while a gather reads from it
+     uint8_t *                                  bounce0 = nullptr; // calling-thread bounce buffer
+@@ -441,7 +444,33 @@ struct llama_ple_disk::impl {
+ 
+         const auto t_read0 = std::chrono::steady_clock::now();
+         if (!misses.empty()) {
+-            run_job(job_kind::read, misses.size(), 1, 2);
++            // in a small gather (a decode), rows already in the page cache are copied right here (a syscall each, no
++            // I/O); only the others need the pool's queue depth, and waking it costs more than a few page-cache reads
++            cold.clear();
++#if defined(RWF_NOWAIT)
++            const bool try_nowait = !direct && nowait && misses.size() <= 256;
++            for (const auto & m : misses) {
++                bool done = false;
++                if (try_nowait) {
++                    struct iovec iov = { raw.data() + (size_t) m.second * rs, rs };
++                    const ssize_t r = preadv2(fd, &iov, 1, (off_t) offs + (off_t) m.first * (off_t) rs, RWF_NOWAIT);
++                    done = r == (ssize_t) rs;
++                    if (r < 0 && errno != EAGAIN) {
++                        nowait = false;
++                    }
++                }
++                if (!done) {
++                    cold.push_back(m);
++                }
++            }
++#else
++            cold = misses;
++#endif
++            std::swap(misses, cold);
++            if (!misses.empty()) {
++                run_job(job_kind::read, misses.size(), 1, 2);
++            }
++            std::swap(misses, cold);
+             if (n_slots) {
+                 for (const auto & m : misses) {
+                     const size_t slot = (size_t) m.first & mask;

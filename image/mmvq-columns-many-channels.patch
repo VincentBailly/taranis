@@ -1,0 +1,110 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 9eaa5a4c..632711c7 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -821,6 +821,82 @@ static __global__ void mul_mat_vec_q8_0_columns_rdna3_5(
+     }
+ }
+ 
++// many channels (a batched 3D product, e.g. the MTP eh_proj over a prompt ubatch): each warp computes c_rows rows of
++// c_cpw channels in turn, each output with exactly the arithmetic of the single-warp kernel above, reusing every
++// activation load for c_rows rows; a block holds 8 such warps on neighbouring channels
++template <int c_ncols, int c_cpw, int c_rows>
++__launch_bounds__(8 * ggml_cuda_get_physical_warp_size(), 1)
++static __global__ void mul_mat_vec_q8_0_columns_chan_rdna3_5(
++        const void * vx_ptr, const void * vy_ptr, float * dst_ptr,
++        const uint32_t ncols_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
++        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
++        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
++        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
++        const uint32_t nchannels_dst) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr int blocks_per_iter = warp_size / 2;
++
++    const int row0 = blockIdx.x * c_rows;
++    const int lane = threadIdx.x;
++    const int half = lane % 2;
++    const uint32_t sample_dst = blockIdx.z;
++    const uint32_t sample_x   = fastdiv(sample_dst, sample_ratio);
++    const int blocks_per_row_x = ncols_x / QK8_0;
++
++    for (int ci = 0; ci < c_cpw; ++ci) {
++        const uint32_t channel_dst = (blockIdx.y * 8 + threadIdx.y) * c_cpw + ci;
++        if (channel_dst >= nchannels_dst) {
++            return;
++        }
++        const uint32_t channel_x = fastdiv(channel_dst, channel_ratio);
++        const block_q8_0 * x = (const block_q8_0 *) vx_ptr + (sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x);
++        const block_q8_1 * y = (const block_q8_1 *) vy_ptr + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
++        float * dst = dst_ptr + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
++
++        float tmp[c_rows][c_ncols] = {{0.0f}};
++        for (int kb = lane/2; kb < blocks_per_row_x; kb += blocks_per_iter) {
++            int4  yv[c_ncols];
++            float dy[c_ncols];
++#pragma unroll
++            for (int j = 0; j < c_ncols; ++j) {
++                const block_q8_1 * by = &y[j*stride_col_y + kb];
++                yv[j] = *(const int4 *) (by->qs + 16*half);
++                dy[j] = __low2float(by->ds);
++            }
++#pragma unroll
++            for (int r = 0; r < c_rows; ++r) {
++                const block_q8_0 * xr = x + r*stride_row_x;
++                const int4  xv = *(const int4 *) (xr[kb].qs + 16*half);
++                const float dx = __half2float(xr[kb].d);
++#pragma unroll
++                for (int j = 0; j < c_ncols; ++j) {
++                    int sumi = ggml_cuda_dp4a(xv.x, yv[j].x, 0);
++                    sumi = ggml_cuda_dp4a(xv.y, yv[j].y, sumi);
++                    sumi = ggml_cuda_dp4a(xv.z, yv[j].z, sumi);
++                    sumi = ggml_cuda_dp4a(xv.w, yv[j].w, sumi);
++                    tmp[r][j] += dx * dy[j] * (float) sumi;
++                }
++            }
++        }
++#pragma unroll
++        for (int r = 0; r < c_rows; ++r) {
++#pragma unroll
++            for (int j = 0; j < c_ncols; ++j) {
++                tmp[r][j] = warp_reduce_sum<warp_size>(tmp[r][j]);
++            }
++        }
++        if (lane == 0) {
++#pragma unroll
++            for (int r = 0; r < c_rows; ++r) {
++#pragma unroll
++                for (int j = 0; j < c_ncols; ++j) {
++                    dst[r + j*stride_col_dst] = tmp[r][j];
++                }
++            }
++        }
++    }
++}
++
+ // kernel variant for 2..4 columns, with K split over 4 warps or not
+ template <bool has_gate, bool c_group, typename F>
+ static void mmvq_q8_0_columns_dispatch(const int64_t ncols_dst, const bool split_k, const F & launch) {
+@@ -851,6 +927,22 @@ static bool mul_mat_vec_q8_0_columns(
+     const dim3 block_dims(32, split_k ? 4 : 1, 1);
+     const uint3 channel_ratio = init_fastdiv_values(nchannels_dst / nchannels_x);
+     const uint3 sample_ratio  = init_fastdiv_values(nsamples_dst / nsamples_x);
++    if (!split_k && vgate == nullptr && nchannels_dst >= 64 && nrows_x % 8 == 0) {
++        constexpr int cpw = 4;
++        const dim3 cb_nums(nrows_x / 8, (nchannels_dst + 8*cpw - 1) / (8*cpw), nsamples_dst);
++        const dim3 cb_dims(32, 8, 1);
++        const auto launch_c = [&](auto kernel) {
++            kernel<<<cb_nums, cb_dims, 0, stream>>>(vx, vy, dst, ncols_x, stride_row_x, stride_col_y, stride_col_dst,
++                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, (uint32_t) nchannels_dst);
++        };
++        switch (ncols_dst) {
++            case 2:  launch_c(mul_mat_vec_q8_0_columns_chan_rdna3_5<2, cpw, 8>); break;
++            case 3:  launch_c(mul_mat_vec_q8_0_columns_chan_rdna3_5<3, cpw, 8>); break;
++            default: launch_c(mul_mat_vec_q8_0_columns_chan_rdna3_5<4, cpw, 8>); break;
++        }
++        return true;
++    }
+     const auto launch = [&](auto kernel) {
+         kernel<<<block_nums, block_dims, 0, stream>>>(vx, vgate, vy, dst, ncols_x, stride_row_x, stride_col_y, stride_col_dst,
+             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,

@@ -1,0 +1,673 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 9bdf7de6..77882a4b 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1566,6 +1566,18 @@ struct ggml_backend_cuda_context {
+     bool mmb_after_compute = true;
+     const void * mmb_first_split = nullptr;
+     std::vector<uint64_t> mmb_graph_sigs;
++
++    // q8_1 copies of F32 activations written by their producer and read by the MMVQs that would quantize them (one graph)
++    struct q8_cache_entry {
++        const ggml_tensor * t;    // the tensor or, for a view, the tensor it views
++        size_t              offs; // view offset
++        int64_t             n;
++        int64_t             ne0;  // row length of the copy's layout
++        int                 last; // last graph node that may read the copy (later ones may see t overwritten)
++        ggml_cuda_pool_alloc<char> * buf;
++    };
++    std::vector<q8_cache_entry> q8_cache;
++    int cur_node = 0; // index of the graph node being evaluated
+     // HC residuals whose remaining readers live in a later split of the same graph on this device: tensor -> uses left
+     std::unordered_map<const ggml_tensor *, int> mmb_res16_pending;
+ 
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 2b66bf74..1dc7ed3a 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -2,6 +2,7 @@
+ #include "gated-delta-net-mma.cuh"
+ #include "ggml-cuda/common.cuh"
+ #include "unary.cuh"
++#include "quantize.cuh"
+ 
+ #include <cstdint>
+ #include <mutex>
+@@ -1649,7 +1650,7 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+ // lanes 0..3 (which reduces to (s0 + s2) + (s1 + s3)), times the norm weight
+ template <int S>
+ __global__ void __launch_bounds__(S, 1)
+-gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, const float eps, const float * z) {
++gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, const float eps, const float * z, block_q8_1 * q8, const int q8_ne0) {
+     constexpr int warp_size = 32;
+     static_assert(S == 4 * warp_size);
+     __shared__ float red[4];
+@@ -1677,11 +1678,11 @@ gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, cons
+     const float mean  = tmp / (float) S;
+     const float scale = rsqrtf(mean + eps);
+     const float normed = scale * xi * norm_w[tid];
+-    if (z != nullptr) {
+-        // the following sigmoid(z) * normed of unary_gated_op_kernel<op_sigmoid>, same expression
+-        out[(int64_t) h * S + tid] = (1.0f / (1.0f + expf(-z[(int64_t) h * S + tid]))) * normed;
+-    } else {
+-        out[(int64_t) h * S + tid] = normed;
++    // the gate is the following sigmoid(z) * normed of unary_gated_op_kernel<op_sigmoid>, same expression
++    const float v = z != nullptr ? (1.0f / (1.0f + expf(-z[(int64_t) h * S + tid]))) * normed : normed;
++    out[(int64_t) h * S + tid] = v;
++    if (q8) {
++        quantize_q8_1_elem(v, q8, offset + (int64_t) h * S + tid, q8_ne0);
+     }
+ }
+ 
+@@ -1712,7 +1713,7 @@ void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_c
+ }
+ 
+ void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in,
+-        const float * z, float * gated_out) {
++        const float * z, float * gated_out, block_q8_1 * q8, int64_t q8_ne0) {
+     GGML_ASSERT(args_in.S == 128 && args_in.d_conv == 4);
+     ggml_cuda_pool_alloc<float> attn(ctx.pool(), args_in.S * args_in.H_v * args_in.n_tokens);
+     ggml_cuda_gdn_decode_args args = args_in;
+@@ -1723,6 +1724,7 @@ void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const
+     const dim3 grid(args.H_v, args.n_tokens, 1);
+     const dim3 norm_block(128, 1, 1);
+     const ggml_cuda_kernel_launch_params norm_params = ggml_cuda_kernel_launch_params(grid, norm_block, 0, ctx.stream());
++    GGML_ASSERT(!q8 || (q8_ne0 % QK8_1 == 0 && (args.S * args.H_v * args.n_tokens) % q8_ne0 == 0));
+     ggml_cuda_kernel_launch(gdn_decode_norm_cuda<128>, norm_params, attn.get(), args.norm_w,
+-        z ? gated_out : args.out, args.eps_rms, z);
++        z ? gated_out : args.out, args.eps_rms, z, q8, (int) q8_ne0);
+ }
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index 77c34d22..8ec48890 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -71,7 +71,8 @@ struct ggml_cuda_gdn_decode_args {
+ 
+ void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args);
+ // same, with the following sigmoid(z) * norm applied by the norm kernel, which then writes gated_out instead of args.out
++// q8: optional q8_1 copy of the output for an MMVQ reading it as rows of q8_ne0 values (see ggml_cuda_q8_cache_produce)
+ void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args,
+-        const float * z, float * gated_out);
++        const float * z, float * gated_out, block_q8_1 * q8 = nullptr, int64_t q8_ne0 = 0);
+ // first kernel only: writes the pre-norm attention output [S, H_v] to attn_scratch (the gated norm is applied by the consumer)
+ void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args, float * attn_scratch);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1edb893f..b55eb13c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4847,6 +4847,40 @@ static bool ggml_cuda_mmb_claims(ggml_backend_cuda_context & ctx, const ggml_ten
+     return t->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(ctx, t->src[0], t->src[1], t);
+ }
+ 
++// q8_1 buffer for the producer of t to fill when an MMVQ reading t follows within a few nodes (the MMVQ would quantize t
++// itself), laid out for the reader's rows of *ne0 values. Without pad the producer only handles rows that need no padding.
++// The copy serves readers up to the window end or the first node that writes into t's memory, whichever comes first.
++static block_q8_1 * ggml_cuda_q8_for_mmvq_reader(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i_last,
++        const ggml_tensor * t, bool pad = false, int64_t * ne0 = nullptr) {
++    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ctx.stream_context().concurrent_events.empty()) {
++        return nullptr;
++    }
++    const ggml_tensor * root = t->view_src ? t->view_src : t;
++    const size_t        offs = t->view_src ? t->view_offs : 0;
++    int64_t row  = 0;
++    int     last = i_last;
++    for (int k = i_last + 1; k < cgraph->n_nodes && k <= i_last + 16; ++k) {
++        const ggml_tensor * n = cgraph->nodes[k];
++        const ggml_tensor * x = n->src[1];
++        if (row == 0 && (n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && x && ggml_is_quantized(n->src[0]->type) &&
++                (x->view_src ? x->view_src : x) == root && (x->view_src ? x->view_offs : 0) == offs &&
++                ggml_is_contiguous(x) && ggml_nelements(x) == ggml_nelements(t) && ggml_nrows(x) <= MMVQ_MAX_BATCH_SIZE &&
++                x->ne[0] % QK8_1 == 0 && (pad || x->ne[0] % MATRIX_ROW_PADDING == 0)) {
++            row = x->ne[0];
++        }
++        const bool view = n->op == GGML_OP_NONE || n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE ||
++            n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE;
++        if ((n->view_src ? n->view_src : n) == root && !view) {
++            break; // writes into t's memory
++        }
++        last = k;
++    }
++    if (ne0) {
++        *ne0 = row;
++    }
++    return row ? ggml_cuda_q8_cache_produce(ctx, t, last, row) : nullptr;
++}
++
+ // ggml_cuda_try_fuse: node i was computed on its own and no later node is skipped
+ static constexpr int GGML_CUDA_FUSED_SELF = -1;
+ 
+@@ -5402,7 +5436,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                         ggml_node_get_use_count(cgraph, norm_idx) == 1 && ggml_node_get_use_count(cgraph, sig_idx) == 1 &&
+                         (norm_out->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (sig->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                     // z and the gated output are read/written element for element by the same thread: in-place is fine
+-                    ggml_cuda_op_gdn_decode_fused_gated(*cuda_ctx, args, (const float *) sig->src[0]->data, (float *) mul->data);
++                    int64_t q8_ne0 = 0;
++                    block_q8_1 * q8 = ggml_cuda_q8_for_mmvq_reader(*cuda_ctx, cgraph, mul_idx, mul, true, &q8_ne0);
++                    ggml_cuda_op_gdn_decode_fused_gated(*cuda_ctx, args, (const float *) sig->src[0]->data, (float *) mul->data, q8, q8_ne0);
+                     return mul_idx - i;
+                 }
+             }
+@@ -6518,6 +6554,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             }
+             const int out_nodes[] = { i + n_ops - 1 };
+             if (ggml_can_fuse_subgraph_ext(cgraph, node_idxs, n_ops, ops, out_nodes, 1)) {
++                args.q8 = ggml_cuda_q8_for_mmvq_reader(*cuda_ctx, cgraph, i + n_ops - 1, args.dst);
+                 ggml_cuda_op_hc_mix_reduce(*cuda_ctx, args);
+                 return n_ops - 1;
+             }
+@@ -6572,6 +6609,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             }
+         }
+         if (skip > 0) {
++            if (!args.single_block && !args.out_inject && args.store_xn_f32 && args.out_xn->ne[0] % 64 == 0) {
++                args.q8_xn = ggml_cuda_q8_for_mmvq_reader(*cuda_ctx, cgraph, i + skip, args.out_xn);
++            }
+             ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
+             return skip;
+         }
+@@ -6668,7 +6708,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 ggml_are_same_shape(mul, other) &&
+                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { i + 2 }) &&
+                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+-            ggml_cuda_op_cont_sigmoid_mul(*cuda_ctx, node, unary, mul, ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, i + 2, mul));
++            int64_t q8_ne0 = 0;
++            uint16_t *   dst16 = ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, i + 2, mul);
++            block_q8_1 * q8    = ggml_cuda_q8_for_mmvq_reader(*cuda_ctx, cgraph, i + 2, mul, true, &q8_ne0);
++            ggml_cuda_op_cont_sigmoid_mul(*cuda_ctx, node, unary, mul, dst16, q8, q8_ne0);
+             return 2;
+         }
+     }
+@@ -6714,8 +6757,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         cgraph->nodes[i + 1]->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
+         ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(cgraph->nodes[i + 1]) &&
+         ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY })) {
+-        ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1],
+-            ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, i + 1, cgraph->nodes[i + 1]));
++        int64_t q8_ne0 = 0;
++        uint16_t *   dst16 = ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, i + 1, cgraph->nodes[i + 1]);
++        block_q8_1 * q8    = ggml_cuda_q8_for_mmvq_reader(*cuda_ctx, cgraph, i + 1, cgraph->nodes[i + 1], true, &q8_ne0);
++        ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1], dst16, q8, q8_ne0);
+         return 1;
+     }
+ 
+@@ -6845,6 +6890,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
++                cuda_ctx->cur_node = i;
+                 if (is_concurrent_event_active) {
+                     GGML_ASSERT(concurrent_event);
+ 
+@@ -7077,6 +7123,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     }
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
++    ggml_cuda_q8_cache_clear(*cuda_ctx);
+ 
+     cuda_ctx->mmb_after_compute = true;
+     return GGML_STATUS_SUCCESS;
+diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
+index c19128eb..aff39301 100644
+--- a/ggml/src/ggml-cuda/hyperconn.cu
++++ b/ggml/src/ggml-cuda/hyperconn.cu
+@@ -1,5 +1,6 @@
+ #include "hyperconn.cuh"
+ #include "mmb.cuh"
++#include "quantize.cuh"
+ #include "ggml-backend-impl.h"
+ 
+ // Explicitly rounded mul/add: keeps the fused kernels from being contracted into FMAs so that
+@@ -83,7 +84,7 @@ static __global__ void hc_combine_f32(
+ 
+ static __global__ void hc_mix_reduce_f32_hc4_parallel(
+         const float * __restrict__ xn, const float * __restrict__ gate, float * __restrict__ dst,
+-        const int64_t n_embd, const int64_t n_tokens, const float scale, const float bias) {
++        const int64_t n_embd, const int64_t n_tokens, const float scale, const float bias, block_q8_1 * __restrict__ q8) {
+     const int lane = threadIdx.x % 32;
+     const int stream = threadIdx.x / 32;
+     const int64_t index = int64_t(blockIdx.x) * 32 + lane;
+@@ -103,7 +104,12 @@ static __global__ void hc_mix_reduce_f32_hc4_parallel(
+         sum = hc_add_rn(sum, products[1][lane]);
+         sum = hc_add_rn(sum, products[2][lane]);
+         sum = hc_add_rn(sum, products[3][lane]);
+-        dst[index] = scale * sum + bias;
++        const float v = scale * sum + bias;
++        dst[index] = v;
++        if (q8) {
++            // warp 0 holds 32 consecutive outputs: one q8_1 block (n_embd % 32 == 0, so the warp is full)
++            quantize_q8_1_warp(v, q8 + blockIdx.x, lane);
++        }
+     }
+ }
+ 
+@@ -168,6 +174,7 @@ void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda
+     const int64_t n_items = n_embd * n_tokens;
+     const uint16_t * xn16 = ggml_cuda_mmb_cache_lookup(ctx, xn);
+     const uint16_t * g16  = ggml_cuda_mmb_cache_lookup(ctx, gate);
++    bool q8_done = false;
+     if (xn16 && g16) {
+         const int threads = 256; const int blocks = (int) ((n_items + threads - 1) / threads);
+         const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+@@ -177,7 +184,9 @@ void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda
+         const int blocks = (int) ((n_items + 31) / 32);
+         const ggml_cuda_kernel_launch_params launch_params(blocks, 128, 0, ctx.stream());
+         ggml_cuda_kernel_launch(hc_mix_reduce_f32_hc4_parallel, launch_params,
+-            (const float *) xn->data, (const float *) gate->data, out, n_embd, n_tokens, args.scale, args.bias);
++            (const float *) xn->data, (const float *) gate->data, out, n_embd, n_tokens, args.scale, args.bias,
++            n_embd % 32 == 0 ? (block_q8_1 *) args.q8 : nullptr);
++        q8_done = n_embd % 32 == 0;
+     } else {
+         const int threads = 256;
+         const int blocks = (int) ((n_items + threads - 1) / threads);
+@@ -189,6 +198,11 @@ void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda
+     if (stage) {
+         CUDA_CHECK(cudaMemcpyAsync(dst->data, out, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+     }
++    if (args.q8 && !q8_done) {
++        // the q8_1 copy was promised to a reader: a kernel without the epilogue quantizes separately
++        quantize_row_q8_1_cuda((const float *) dst->data, nullptr, args.q8, GGML_TYPE_Q8_0, n_embd, n_embd, n_embd*n_tokens,
++            n_embd*n_tokens, n_embd, n_tokens, 1, 1, ctx.stream());
++    }
+ }
+ 
+ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_combine_args & args) {
+@@ -413,7 +427,7 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
+         float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
+         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
+         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps,
+-        const float * w_inj, float * inj) {
++        const float * w_inj, float * inj, block_q8_1 * q8 = nullptr) {
+     const int tid = threadIdx.x;
+     const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
+     const float x2 = hc_sigmoid(x1);
+@@ -466,6 +480,10 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
+             const float2 gv = *(const float2 *)(g + col);
+             const float v0 = scale * xs[2 * k] * gv.x, v1 = scale * xs[2 * k + 1] * gv.y;
+             if (store_xn_f32) *(float2 *)(xn + col) = make_float2(v0, v1);
++            if (q8) {
++                // a half warp holds 32 consecutive values as pairs (n_embd % 64 == 0, so whole warps are in range)
++                quantize_q8_1_pairs(v0, v1, q8 + (row * n_embd + col) / QK8_1, tid % 16);
++            }
+             if (xh) *(uint32_t *)(xh + col) = hc_pack2(v0, v1);
+             if constexpr (INJECT) {
+ #pragma unroll
+@@ -493,11 +511,11 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
+         const float * block_out, const float * gamma,
+         float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
+         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
+-        const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps) {
++        const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps, block_q8_1 * q8) {
+     __shared__ float s_sum[32];
+     hc_combine_norm_row_b256<false>(blockIdx.x, blockIdx.y, gridDim.x, s_sum, inject, residual, block_out, gamma,
+         out_res, out_xn, out_xn_bf16, store_xn_f32, res_in_bf16, res_out_bf16, blk_in_bf16,
+-        n_embd, s1, b1, s2, b2, eps, nullptr, nullptr);
++        n_embd, s1, b1, s2, b2, eps, nullptr, nullptr, q8);
+ }
+ 
+ // One block per token over all HC_INJ_HC streams: the rows of hc_combine_norm_f32_b256 plus the next mix's inject projection.
+@@ -554,6 +572,7 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
+     GGML_ASSERT(ggml_nelements(a.block_out) == n_embd * n_tokens && ggml_nelements(a.gamma) == n_embd * hc &&
+                 ggml_nelements(a.inject) == hc * n_tokens);
+ 
++    GGML_ASSERT(!a.q8_xn || (!a.single_block && !a.out_inject && a.store_xn_f32 && n_embd % 64 == 0));
+     if (a.single_block) {
+         GGML_ASSERT(hc <= HC_CN_SINGLE_MAX_HC);
+         GGML_ASSERT(a.store_xn_f32 && !a.out_xn_bf16 && !a.res_in_bf16 && !a.res_out_bf16 && !a.blk_in_bf16);
+@@ -587,5 +606,6 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
+         (const float *) a.block_out->data, (const float *) a.gamma->data,
+         (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
+         a.res_in_bf16, a.res_out_bf16, a.blk_in_bf16,
+-        (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps);
++        (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps,
++        (block_q8_1 *) a.q8_xn);
+ }
+diff --git a/ggml/src/ggml-cuda/hyperconn.cuh b/ggml/src/ggml-cuda/hyperconn.cuh
+index 0d76c04a..12870ccb 100644
+--- a/ggml/src/ggml-cuda/hyperconn.cuh
++++ b/ggml/src/ggml-cuda/hyperconn.cuh
+@@ -20,6 +20,7 @@ struct ggml_cuda_hc_mix_args {
+     int                 hc;
+     float               scale;
+     float               bias;
++    void *              q8 = nullptr; // optional block_q8_1 copy of dst (see ggml_cuda_q8_cache_produce)
+ };
+ 
+ struct ggml_cuda_hc_combine_args {
+@@ -57,6 +58,7 @@ struct ggml_cuda_hc_combine_norm_args {
+     uint16_t *          res_out_bf16 = nullptr;
+     const ggml_tensor * w_inject     = nullptr;   // [hc * n_embd, hc] F32 weight
+     ggml_tensor *       out_inject   = nullptr;   // [hc, T] F32, the skipped MUL_MAT node
++    void *              q8_xn        = nullptr;   // optional block_q8_1 copy of out_xn (see ggml_cuda_q8_cache_produce)
+ };
+ 
+ bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index c6761f8d..9eaa5a4c 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -904,9 +904,14 @@ bool ggml_cuda_mul_mat_vec_q8_0_columns_group(ggml_backend_cuda_context & ctx, g
+     cudaStream_t stream = ctx.stream();
+     const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1];
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+-    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), GGML_TYPE_Q8_0, ne10, src1->nb[1]/sizeof(float),
+-        src1->nb[2]/sizeof(float), src1->nb[3]/sizeof(float), ne10_padded, ne11, 1, 1, stream);
++    const block_q8_1 * src1_q8_cached = ggml_cuda_q8_cache_lookup(ctx, src1);
++    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
++    if (!src1_q8_cached) {
++        src1_q8_1.alloc(ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
++        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), GGML_TYPE_Q8_0, ne10, src1->nb[1]/sizeof(float),
++            src1->nb[2]/sizeof(float), src1->nb[3]/sizeof(float), ne10_padded, ne11, 1, 1, stream);
++    }
++    const void * src1_q8 = src1_q8_cached ? (const void *) src1_q8_cached : (const void *) src1_q8_1.get();
+ 
+     mmvq_q8_0_columns_group grp{};
+     uint32_t rows = 0;
+@@ -926,7 +931,7 @@ bool ggml_cuda_mul_mat_vec_q8_0_columns_group(ggml_backend_cuda_context & ctx, g
+     const dim3 block_dims(32, split_k ? 4 : 1, 1);
+     const uint3 one = init_fastdiv_values(1);
+     const auto launch = [&](auto kernel) {
+-        kernel<<<block_nums, block_dims, 0, stream>>>(nullptr, nullptr, src1_q8_1.get(), nullptr, ne10, 0, ne10_padded / QK8_1, 0,
++        kernel<<<block_nums, block_dims, 0, stream>>>(nullptr, nullptr, src1_q8, nullptr, ne10, 0, ne10_padded / QK8_1, 0,
+             one, 0, 0, 0, one, 0, 0, 0, grp);
+     };
+     mmvq_q8_0_columns_dispatch<false, true>(ne11, split_k, launch);
+@@ -4054,13 +4059,16 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+-    {
++    const block_q8_1 * src1_q8_cached = ggml_cuda_q8_cache_lookup(ctx, src1);
++    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
++    if (!src1_q8_cached) {
++        src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+     }
++    const void * src1_q8 = src1_q8_cached ? (const void *) src1_q8_cached : (const void *) src1_q8_1.get();
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+     const int64_t s11 = ne10_padded / QK8_1;
+@@ -4093,19 +4101,19 @@ void ggml_cuda_mul_mat_vec_q(
+         fusion_local.x_bias == nullptr && fusion_local.gate_bias == nullptr && fusion_local.x_scale == nullptr &&
+         fusion_local.gate_scale == nullptr && fusion_local.shared_up == nullptr;
+     if (src0->type == GGML_TYPE_Q8_0 && ids == nullptr && (no_fusion || glu_columns) && !exact_batch &&
+-            mul_mat_vec_q8_0_columns(src0->data, glu_columns ? fusion_local.gate : nullptr, src1_q8_1.get(), dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
++            mul_mat_vec_q8_0_columns(src0->data, glu_columns ? fusion_local.gate : nullptr, src1_q8, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+                 ne02, nchannels_dst, s02, stride_channel_y, stride_channel_dst, ne03, ne3, s03, s13, s3, stream)) {
+         return;
+     }
+     if (ids == nullptr && no_fusion && !exact_batch &&
+-            mul_mat_vec_kq_columns(src0->type, src0->data, src1_q8_1.get(), dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
++            mul_mat_vec_kq_columns(src0->type, src0->data, src1_q8, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+                 ne02, nchannels_dst, s02, stride_channel_y, stride_channel_dst, ne03, ne3, s03, s13, s3, stream)) {
+         return;
+     }
+ #endif // defined(GGML_USE_HIP)
+ 
+     mul_mat_vec_q_switch_type(
+-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
++        src0->data, src0->type, src1_q8, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
+index 7183204f..c3a51045 100644
+--- a/ggml/src/ggml-cuda/quantize.cu
++++ b/ggml/src/ggml-cuda/quantize.cu
+@@ -759,3 +759,44 @@ void quantize_mmq_fp4_cuda(
+         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+     }
+ }
++
++block_q8_1 * ggml_cuda_q8_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int last, int64_t ne0) {
++    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || ne0 % QK8_1 != 0 || ggml_nelements(t) % ne0 != 0) {
++        return nullptr;
++    }
++    // copies whose last reader has run are no longer needed
++    for (size_t k = 0; k < ctx.q8_cache.size(); ) {
++        if (ctx.q8_cache[k].last < ctx.cur_node) {
++            delete ctx.q8_cache[k].buf;
++            ctx.q8_cache.erase(ctx.q8_cache.begin() + k);
++        } else {
++            ++k;
++        }
++    }
++    const int64_t n = ggml_nelements(t);
++    auto * buf = new ggml_cuda_pool_alloc<char>(ctx.pool(), n/ne0 * GGML_PAD(ne0, MATRIX_ROW_PADDING)/QK8_1 * sizeof(block_q8_1));
++    ctx.q8_cache.push_back({ t->view_src ? t->view_src : t, t->view_src ? t->view_offs : 0, n, ne0, last, buf });
++    return (block_q8_1 *) buf->get();
++}
++
++const block_q8_1 * ggml_cuda_q8_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
++    if (ctx.q8_cache.empty() || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
++        return nullptr;
++    }
++    // keyed by tensor, not address: the graph allocator hands a freed activation's memory to later tensors
++    const ggml_tensor * root = t->view_src ? t->view_src : t;
++    const size_t        offs = t->view_src ? t->view_offs : 0;
++    for (const auto & e : ctx.q8_cache) {
++        if (e.t == root && e.offs == offs && e.n == ggml_nelements(t) && e.ne0 == t->ne[0] && ctx.cur_node <= e.last) {
++            return (const block_q8_1 *) e.buf->get();
++        }
++    }
++    return nullptr;
++}
++
++void ggml_cuda_q8_cache_clear(ggml_backend_cuda_context & ctx) {
++    for (auto & e : ctx.q8_cache) {
++        delete e.buf;
++    }
++    ctx.q8_cache.clear();
++}
+diff --git a/ggml/src/ggml-cuda/quantize.cuh b/ggml/src/ggml-cuda/quantize.cuh
+index 1801da05..fedf0a86 100644
+--- a/ggml/src/ggml-cuda/quantize.cuh
++++ b/ggml/src/ggml-cuda/quantize.cuh
+@@ -75,3 +75,64 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
+                                     int64_t         nrows_dst,
+                                     int             n_expert_used,
+                                     cudaStream_t    stream);
++
++// 32 consecutive values, one per lane of a full warp, quantized exactly like quantize_q8_1 (same reductions and rounding)
++static __device__ __forceinline__ void quantize_q8_1_warp(const float xi, block_q8_1 * y, const int lane) {
++    float amax = fabsf(xi);
++    float sum  = xi;
++    amax = warp_reduce_max<QK8_1>(amax);
++    sum  = warp_reduce_sum<QK8_1>(sum);
++    const float  d = amax / 127.0f;
++    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++    y->qs[lane] = q;
++    if (lane == 0) {
++        y->ds = make_half2(d, sum);
++    }
++}
++
++// element i of a q8_1 copy with rows of ne0 values (ne0 % QK8_1 == 0), written by lane i % QK8_1 of the full warp that holds
++// the 32 values of its block; the warp with the last block of a row also writes the row's zero padding blocks
++static __device__ __forceinline__ void quantize_q8_1_elem(const float v, block_q8_1 * q8, const int64_t i, const int64_t ne0) {
++    const int64_t nb  = ne0 / QK8_1;
++    const int64_t nbp = GGML_PAD(ne0, MATRIX_ROW_PADDING) / QK8_1;
++    const int64_t ib  = (i / QK8_1) % nb;
++    const int     lane = i % QK8_1;
++    block_q8_1 * y = q8 + (i / ne0) * nbp + ib;
++    quantize_q8_1_warp(v, y, lane);
++    if (ib == nb - 1) {
++        for (int64_t b = 1; b < nbp - nb + 1; ++b) {
++            y[b].qs[lane] = 0;
++            if (lane == 0) {
++                y[b].ds = make_half2(0.0f, 0.0f);
++            }
++        }
++    }
++}
++
++// the same for 32 consecutive values held as pairs (v0, v1) = (x[2*p], x[2*p + 1]) by the 16 lanes p of a half warp: the
++// butterfly over elements pairs element j with j^16, j^8, j^4, j^2 (lanes p^8 .. p^1), then j^1 (the other pair member)
++static __device__ __forceinline__ void quantize_q8_1_pairs(const float v0, const float v1, block_q8_1 * y, const int p) {
++    float amax = fmaxf(fabsf(v0), fabsf(v1));
++    float a = v0;
++    float b = v1;
++#pragma unroll
++    for (int offset = 8; offset > 0; offset >>= 1) {
++        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, 16));
++        a += __shfl_xor_sync(0xffffffff, a, offset, 16);
++        b += __shfl_xor_sync(0xffffffff, b, offset, 16);
++    }
++    const float sum = a + b;
++    const float d   = amax / 127.0f;
++    y->qs[2*p + 0] = amax == 0.0f ? 0 : (int8_t) roundf(v0 / d);
++    y->qs[2*p + 1] = amax == 0.0f ? 0 : (int8_t) roundf(v1 / d);
++    if (p == 0) {
++        y->ds = make_half2(d, sum);
++    }
++}
++
++// The producer of a contiguous F32 activation t can also write the q8_1 copy an MMVQ reading t would quantize: produce()
++// returns the buffer, in the MMVQ's layout for rows of ne0 values (each row padded to MATRIX_ROW_PADDING with zero
++// blocks), and lookup() finds it for an MMVQ reading t as rows of ne0 values up to graph node last.
++block_q8_1 *       ggml_cuda_q8_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int last, int64_t ne0);
++const block_q8_1 * ggml_cuda_q8_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
++void               ggml_cuda_q8_cache_clear(ggml_backend_cuda_context & ctx);
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index b9c04e7c..767b0603 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -1,5 +1,6 @@
+ #include "unary.cuh"
+ #include "convert.cuh"
++#include "quantize.cuh"
+ 
+ static __device__ __forceinline__ float op_abs(float x) {
+     return fabsf(x);
+@@ -305,7 +306,7 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+ template <float (*op)(float), typename T>
+ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
+-        uint16_t * dst16) {
++        uint16_t * dst16, block_q8_1 * q8, const int64_t q8_ne0) {
+     ggml_cuda_pdl_lc();
+     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+ 
+@@ -323,14 +324,17 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
+     if (dst16) {
+         dst16[i] = ggml_cuda_f32_to_bf16_rne(ggml_cuda_cast<float>(v));
+     }
++    if (q8) {
++        quantize_q8_1_elem(ggml_cuda_cast<float>(v), q8, i, q8_ne0);
++    }
+ }
+ 
+ template <float (*op)(float), typename T>
+ static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream,
+-        uint16_t * dst16 = nullptr) {
++        uint16_t * dst16 = nullptr, block_q8_1 * q8 = nullptr, const int64_t q8_ne0 = 0) {
+     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1, dst16);
++    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1, dst16, q8, q8_ne0);
+ }
+ 
+ template <float (*op)(float)>
+@@ -768,7 +772,8 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
+ }
+ 
+ void ggml_cuda_op_cont_sigmoid_mul(
+-        ggml_backend_cuda_context & ctx, ggml_tensor * cont_node, ggml_tensor * unary_node, ggml_tensor * mul_node, uint16_t * dst16) {
++        ggml_backend_cuda_context & ctx, ggml_tensor * cont_node, ggml_tensor * unary_node, ggml_tensor * mul_node, uint16_t * dst16,
++        block_q8_1 * q8, int64_t q8_ne0) {
+     const ggml_tensor * gate = cont_node->src[0];
+     const ggml_tensor * other = mul_node->src[0] == unary_node ? mul_node->src[1] : mul_node->src[0];
+ 
+@@ -780,8 +785,9 @@ void ggml_cuda_op_cont_sigmoid_mul(
+ 
+     const int64_t k = ggml_nelements(other);
+     const int64_t n = gate->ne[0];
++    GGML_ASSERT(!q8 || (q8_ne0 % QK8_1 == 0 && k % q8_ne0 == 0 && CUDA_GLU_BLOCK_SIZE % QK8_1 == 0));
+     unary_gated_cuda<op_sigmoid>((const float *) gate->data, (const float *) other->data, (float *) mul_node->data,
+-        k, n, gate->nb[1] / sizeof(float), n, ctx.stream(), dst16);
++        k, n, gate->nb[1] / sizeof(float), n, ctx.stream(), dst16, q8, q8_ne0);
+ }
+ 
+ /* fused relu + sqr */
+@@ -805,7 +811,8 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
+ /* fused scale + unary */
+ 
+ template <float (*op)(float)>
+-static __global__ void scale_unary_kernel(const float * x, float * dst, const float scale, const float bias, const int k, uint16_t * dst16) {
++static __global__ void scale_unary_kernel(const float * x, float * dst, const float scale, const float bias, const int k, uint16_t * dst16,
++        block_q8_1 * q8, const int q8_ne0) {
+     const int i = blockDim.x*blockIdx.x + threadIdx.x;
+ 
+     if (i >= k) {
+@@ -818,17 +825,21 @@ static __global__ void scale_unary_kernel(const float * x, float * dst, const fl
+     if (dst16) {
+         dst16[i] = ggml_cuda_f32_to_bf16_rne(v);
+     }
++    if (q8) {
++        quantize_q8_1_elem(v, q8, i, q8_ne0);
++    }
+ }
+ 
+ template <float (*op)(float)>
+ static void scale_unary_cuda(const float * x, float * dst, const float scale, const float bias, const int k, cudaStream_t stream,
+-        uint16_t * dst16) {
++        uint16_t * dst16, block_q8_1 * q8, const int q8_ne0) {
+     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+-    ggml_cuda_kernel_launch(scale_unary_kernel<op>, launch_params, x, dst, scale, bias, k, dst16);
++    ggml_cuda_kernel_launch(scale_unary_kernel<op>, launch_params, x, dst, scale, bias, k, dst16, q8, q8_ne0);
+ }
+ 
+-void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node, uint16_t * dst16) {
++void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node, uint16_t * dst16,
++        block_q8_1 * q8, int64_t q8_ne0) {
+     const ggml_tensor * src = scale_node->src[0];
+ 
+     GGML_ASSERT(src->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32 && unary_node->type == GGML_TYPE_F32);
+@@ -838,13 +849,15 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
+     const float scale = ggml_get_op_params_f32(scale_node, 0);
+     const float bias  = ggml_get_op_params_f32(scale_node, 1);
+     const int   k     = ggml_nelements(src);
++    // q8 (rows of q8_ne0 values): whole warps of 32 consecutive values
++    GGML_ASSERT(!q8 || (q8_ne0 % QK8_1 == 0 && k % q8_ne0 == 0 && CUDA_NEG_BLOCK_SIZE % QK8_1 == 0));
+ 
+     switch (ggml_get_unary_op(unary_node)) {
+         case GGML_UNARY_OP_SILU:
+-            scale_unary_cuda<op_silu>((const float *) src->data, (float *) unary_node->data, scale, bias, k, ctx.stream(), dst16);
++            scale_unary_cuda<op_silu>((const float *) src->data, (float *) unary_node->data, scale, bias, k, ctx.stream(), dst16, q8, q8_ne0);
+             break;
+         case GGML_UNARY_OP_SIGMOID:
+-            scale_unary_cuda<op_sigmoid>((const float *) src->data, (float *) unary_node->data, scale, bias, k, ctx.stream(), dst16);
++            scale_unary_cuda<op_sigmoid>((const float *) src->data, (float *) unary_node->data, scale, bias, k, ctx.stream(), dst16, q8, q8_ne0);
+             break;
+         default:
+             GGML_ABORT("unsupported unary op for fused scale+unary");
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index 07192f79..24f927d3 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -95,7 +95,8 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+ 
+ void ggml_cuda_op_cont_sigmoid_mul(
+-        ggml_backend_cuda_context & ctx, ggml_tensor * cont_node, ggml_tensor * unary_node, ggml_tensor * mul_node, uint16_t * dst16 = nullptr);
++        ggml_backend_cuda_context & ctx, ggml_tensor * cont_node, ggml_tensor * unary_node, ggml_tensor * mul_node, uint16_t * dst16 = nullptr,
++        block_q8_1 * q8 = nullptr, int64_t q8_ne0 = 0);
+ 
+ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
+ 
+@@ -127,7 +128,9 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
+ }
+ 
+ // fused GGML_OP_SCALE + GGML_UNARY_OP_{SILU,SIGMOID}: dst = op(scale*x + bias)
+-void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node, uint16_t * dst16 = nullptr);
++// q8: optional q8_1 copy of the result for an MMVQ reading it as rows of q8_ne0 values (see ggml_cuda_q8_cache_produce)
++void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node, uint16_t * dst16 = nullptr,
++        block_q8_1 * q8 = nullptr, int64_t q8_ne0 = 0);
+ 
+ // out = other + src * sigmoid(gate[row]) (gate: one value per row)
+ void ggml_cuda_op_sigmoid_gate_mul_add(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * src,

@@ -1,0 +1,71 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a72050ea..68134674 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4288,7 +4288,7 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
+     const ggml_tensor * src = relu->src[0];
+     if (!src || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) || !ggml_are_same_shape(src, relu)) return 0;
+     const int64_t nb = relu->ne[0], H = relu->ne[1], nt = relu->ne[2], ns = relu->ne[3];
+-    if (H < 2 || H > 32 || nb < 64 || nt * ns < 64 || nt * ns > UINT16_MAX) return 0;
++    if (H < 2 || H > 32 || nb < 64 || nt * ns > UINT16_MAX) return 0;
+     auto is_slice = [&](const ggml_tensor * v, int64_t h) {
+         return v->op == GGML_OP_VIEW && v->view_src == relu && v->type == GGML_TYPE_F32 &&
+                v->ne[0] == nb && v->ne[1] == nt && v->ne[2] == ns && v->ne[3] == 1 &&
+@@ -4443,6 +4443,7 @@ static int ggml_cuda_match_idx_gemm(ggml_backend_cuda_context & ctx, const ggml_
+         rs->ne[1] * rs->ne[2] != mm->ne[1] * mm->ne[2] * mm->ne[3]) return 0;
+     const ggml_tensor * relu = g->nodes[i + 2];
+     if (relu->op != GGML_OP_UNARY || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU || relu->src[0] != rs) return 0;
++    if (relu->ne[2] * relu->ne[3] < 64) return 0; // the decode score stays on the plain MUL_MAT
+     const int c = ggml_cuda_match_idx_relu_sum(g, i + 2, a);
+     if (c <= 0 || a.score != rs || a.heads != 4) return 0;
+     if (!ggml_cuda_mmb_idx_score_supported(ctx, mm->src[0], mm->src[1], mm, a.heads)) return 0;
+diff --git a/ggml/src/ggml-cuda/qsa-decode-wmma.cuh b/ggml/src/ggml-cuda/qsa-decode-wmma.cuh
+index 63af09d3..c10e851c 100644
+--- a/ggml/src/ggml-cuda/qsa-decode-wmma.cuh
++++ b/ggml/src/ggml-cuda/qsa-decode-wmma.cuh
+@@ -38,22 +38,21 @@ static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
+     float maximum = -INFINITY, normalizer = 0.0f;
+     const int begin = split*chunk, end = min(ns, begin+chunk);
+     for (int start = begin; start < end; start += 16) {
+-        int keys[16];
++        // lane-parallel id + mask fetch: one load each per step instead of 16 serialized chains
++        int myk = (lane < 16 && start+lane < end) ? ir[start+lane] : -1;
++        float mymask = 0.0f;
++        if (myk < 0 || myk >= nk) { myk = -1; }
++        else if (mr) { mymask = __half2float(mr[myk]); if (mymask == -INFINITY) { myk = -1; } }
++        int keys[16]; float kmask[16];
+ #pragma unroll
+-        for (int j = 0; j < 16; ++j) {
+-            int key = start+j < end ? ir[start+j] : -1;
+-            if (key < 0 || key >= nk || (mr && __half2float(mr[key]) == -INFINITY)) { key = -1; }
+-            keys[j] = key;
+-        }
++        for (int j = 0; j < 16; ++j) { keys[j] = __builtin_amdgcn_readlane(myk, j); kmask[j] = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, mymask), j)); }
+         qd_float8 scores = {};
+ #pragma unroll
+         for (int t = 0; t < 2; ++t) {
+-            qd_half16 kf = {};
+             const int key = keys[r];
+-            if (key >= 0 && key < nk) {
+-                const uint16_t * src = (const uint16_t *) (k + key*k1 + kvh*k2) + 32*w+16*t;
+-                kf = __builtin_bit_cast(qd_half16, (uint4[2]){*(const uint4 *)src, *(const uint4 *)(src+8)});
+-            }
++            const uint16_t * src = (const uint16_t *) (k + (key >= 0 ? key : 0)*k1 + kvh*k2) + 32*w+16*t;
++            qd_half16 kf = __builtin_bit_cast(qd_half16, (uint4[2]){*(const uint4 *)src, *(const uint4 *)(src+8)});
++            if (key < 0) { kf = (qd_half16){}; }
+             scores = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf, qf[t], scores);
+         }
+         shared.scores[w][lane*2] = make_float4(scores[0],scores[1],scores[2],scores[3]);
+@@ -70,9 +69,10 @@ static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
+             float local = -INFINITY;
+ #pragma unroll
+             for (int e = 0; e < 8; ++e) {
+-                const int key = keys[2*e+hi];
++                const int key = hi ? keys[2*e+1] : keys[2*e];
++                const float mk = hi ? kmask[2*e+1] : kmask[2*e];
+                 if (key < 0 || key >= nk) { score[e] = -INFINITY; }
+-                else if (mr) { score[e] += __half2float(mr[key]); }
++                else if (mr) { score[e] += mk; }
+                 local = fmaxf(local,score[e]);
+             }
+             local = fmaxf(local,__shfl_xor(local,16));

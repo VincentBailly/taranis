@@ -1,0 +1,104 @@
+--- a/ggml/src/ggml-cuda/mmb-quant.cuh
++++ b/ggml/src/ggml-cuda/mmb-quant.cuh
+@@ -110,17 +110,28 @@
+     r.qh[1].x = *(const uint16_t *)(x->qh + 4); r.qh[1].y = *(const uint16_t *)(x->qh + 6);
+     r.dsc.x = *(const uint16_t *) &x->d; r.dsc.y = *(const uint16_t *)(x->scales); r.sc23 = *(const uint16_t *)(x->scales + 2);
+ }
+-template <int s, int NIL>   // decode units il0 .. il0 + NIL - 1 (8 weights each) of the sub-block
+-__device__ __forceinline__ void mmb_iq3s_storeT(const mmb_iq3s_rawT & r, const uint32_t * gidx, const int sub, const bool ok, const int il0, uint16_t * dst) {
++template <int s, int NIL>   // decode units il0 .. il0 + NIL - 1 (8 weights each) of the sub-block into registers
++__device__ __forceinline__ void mmb_iq3s_decT(const mmb_iq3s_rawT & r, const uint32_t * gidx, const int sub, const bool ok, const int il0, uint4 * out) {
+     const uint32_t qh = ((uint32_t) r.qh[s / 2][s & 1] >> 8 * sub) & 0xff;                      // qh[2s + sub]
+     const uint32_t sc = ((((uint32_t) (s < 2 ? r.dsc.y : r.sc23) >> 8 * (s & 1)) & 0xff) >> 4 * sub) & 0xf;
+     const float d = mmb_h2f(ok ? (uint16_t) r.dsc.x : (uint16_t) 0) * (1 + 2 * (int) sc);
+     auto rb = [](const float x) { const uint32_t u = __float_as_uint(x); return u + 0x7fffu + ((u >> 16) & 1u); };
+-    uint32_t P[4];
++    uint32_t L03, H03, L47, H47;
++    if constexpr (NIL == 2) {   // two threads (adjacent lanes) per sub-block: each rounds half of the table, swap halves via DPP
++        const bool hi = il0 >= 2; const float c = hi ? 8.0f : 0.0f;
++        const uint32_t P0 = __builtin_amdgcn_perm(rb(d * (c + 3.0f)), rb(d * (c + 1.0f)), 0x07060302u);
++        const uint32_t P1 = __builtin_amdgcn_perm(rb(d * (c + 7.0f)), rb(d * (c + 5.0f)), 0x07060302u);
++        const uint32_t Lm = __builtin_amdgcn_perm(P1, P0, 0x06040200u), Hm = __builtin_amdgcn_perm(P1, P0, 0x07050301u);
++        const uint32_t Lo = (uint32_t) __builtin_amdgcn_mov_dpp((int) Lm, 0xB1, 0xF, 0xF, true);
++        const uint32_t Ho = (uint32_t) __builtin_amdgcn_mov_dpp((int) Hm, 0xB1, 0xF, 0xF, true);
++        L03 = hi ? Lo : Lm; H03 = hi ? Ho : Hm; L47 = hi ? Lm : Lo; H47 = hi ? Hm : Ho;
++    } else {
++        uint32_t P[4];
+ #pragma unroll
+-    for (int v = 0; v < 4; ++v) P[v] = __builtin_amdgcn_perm(rb(d * (float) (4 * v + 3)), rb(d * (float) (4 * v + 1)), 0x07060302u);
+-    const uint32_t L03 = __builtin_amdgcn_perm(P[1], P[0], 0x06040200u), H03 = __builtin_amdgcn_perm(P[1], P[0], 0x07050301u);
+-    const uint32_t L47 = __builtin_amdgcn_perm(P[3], P[2], 0x06040200u), H47 = __builtin_amdgcn_perm(P[3], P[2], 0x07050301u);
++        for (int v = 0; v < 4; ++v) P[v] = __builtin_amdgcn_perm(rb(d * (float) (4 * v + 3)), rb(d * (float) (4 * v + 1)), 0x07060302u);
++        L03 = __builtin_amdgcn_perm(P[1], P[0], 0x06040200u); H03 = __builtin_amdgcn_perm(P[1], P[0], 0x07050301u);
++        L47 = __builtin_amdgcn_perm(P[3], P[2], 0x06040200u); H47 = __builtin_amdgcn_perm(P[3], P[2], 0x07050301u);
++    }
+     const uint32_t q[2] = {__builtin_bit_cast(uint32_t, r.qs[2 * s]), __builtin_bit_cast(uint32_t, r.qs[2 * s + 1])};
+     const uint32_t sg = ok ? __builtin_bit_cast(uint32_t, r.sg[s]) : 0u;
+ #pragma unroll
+@@ -136,9 +147,16 @@
+             const uint32_t hb = __builtin_amdgcn_perm(H47, H03, idx) ^ (((n * 0x204081u) & 0x01010101u) << 7);
+             o[2 * k] = __builtin_amdgcn_perm(hb, lb, 0x05010400u); o[2 * k + 1] = __builtin_amdgcn_perm(hb, lb, 0x07030602u);
+         }
+-        *(uint4 *)(dst + 8 * il) = make_uint4(o[0], o[1], o[2], o[3]);
++        out[ii] = make_uint4(o[0], o[1], o[2], o[3]);
+     }
+ }
++template <int s, int NIL>   // ... and store them to LDS
++__device__ __forceinline__ void mmb_iq3s_storeT(const mmb_iq3s_rawT & r, const uint32_t * gidx, const int sub, const bool ok, const int il0, uint16_t * dst) {
++    uint4 o[NIL];
++    mmb_iq3s_decT<s, NIL>(r, gidx, sub, ok, il0, o);
++#pragma unroll
++    for (int ii = 0; ii < NIL; ++ii) *(uint4 *)(dst + 8 * (il0 + ii)) = o[ii];
++}
+ template <int s>
+ __device__ __forceinline__ void mmb_iq3s_pack4(const mmb_iq3s_raw4 & r, const int sub, uint32_t & w0, uint32_t & w1) {
+     const uint32_t qs = (s & 1) ? r.qs[s / 2].y : r.qs[s / 2].x, qh = (s & 1) ? r.qh[s / 2].y : r.qh[s / 2].x, sg = (s & 1) ? r.sg[s / 2].y : r.sg[s / 2].x;
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -577,7 +577,36 @@
+                 }
+         }
+     };
+-    if constexpr (B4) {
++    if constexpr (B4T) {   // k-steps 1..3 of a block are decoded into registers before the previous step's WMMAs
++        constexpr int NIL = 4 / TPS;
++        const int row = tcomb >> 2;
++        uint16_t * dst = ((tcomb >> 1) & 1 ? Au : Ag) + row * MMB_LDS_STRIDE + 32 * (tcomb & 1);
++        uint4 dec[NIL];
++        load_regs(0); fetch4(0); __syncthreads(); store4(std::integral_constant<int, 0>{}); store_lds(); __syncthreads();
++        for (int ks4 = 0; ks4 < nks; ks4 += 4) {
++            auto step = [&](auto qs) {
++                constexpr int s = decltype(qs)::value;
++                const int ks = ks4 + s;
++                if (ks + 1 < nks) {
++                    load_regs(ks + 1);
++                    if constexpr (s < 3) mmb_iq3s_decT<s + 1, NIL>(rT, lbgrid, tcomb & 1, row < a_rows, tpart * NIL, dec);
++                    else fetch4((ks + 1) / 4);
++                }
++                mma();
++                __syncthreads();
++                if (ks + 1 < nks) {
++                    if constexpr (s < 3) {
++#pragma unroll
++                        for (int ii = 0; ii < NIL; ++ii) *(uint4 *)(dst + 8 * (tpart * NIL + ii)) = dec[ii];
++                    } else store4(std::integral_constant<int, 0>{});
++                    store_lds();
++                }
++                __syncthreads();
++            };
++            step(std::integral_constant<int, 0>{}); step(std::integral_constant<int, 1>{});
++            step(std::integral_constant<int, 2>{}); step(std::integral_constant<int, 3>{});
++        }
++    } else if constexpr (B4) {
+         load_regs(0); fetch4(0); __syncthreads(); store4(std::integral_constant<int, 0>{}); store_lds(); __syncthreads();
+         for (int ks4 = 0; ks4 < nks; ks4 += 4) {
+             auto step = [&](auto qs) {
+@@ -620,7 +649,7 @@
+ 
+ template <int BM, int BN, int WTM, int WTN, int WTYPE = 0, bool Q4K_HALF = false, int NT = MMB_NT>
+ // small routed tiles: at least 10 waves per SIMD (the whole-block IQ3_S fetch otherwise drops them to 8)
+-__global__ void __launch_bounds__(NT, (BN == 32 && BM == 64) ? 10 : 2)
++__global__ void __launch_bounds__(NT, (BN == 32 && BM == 64) ? 10 : NT == 512 ? 8 : 2)
+ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t expert_bytes, const uint16_t * __restrict__ Xh,
+         float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32,
+         const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,

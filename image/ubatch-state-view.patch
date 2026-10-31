@@ -1,0 +1,34 @@
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -883,7 +883,12 @@
+     const bool has_state = !state_vec.empty();
+ 
+     const int64_t n_embd_all  = use_embd  ? (int64_t) n_tokens*n_embd       : 0;
+-    const int64_t n_state_all = has_state ? (int64_t) n_tokens*n_embd_state : 0;
++    // state rows of consecutive batch entries are read in place from state_vec (it lives until the next init)
++    bool state_view = has_state;
++    for (size_t i = 1; state_view && i < idxs.size(); ++i) {
++        state_view = idxs[i] == idxs[0] + (int32_t) i;
++    }
++    const int64_t n_state_all = has_state && !state_view ? (int64_t) n_tokens*n_embd_state : 0;
+     const int64_t n_pos_all   =             (int64_t) n_tokens*n_pos_per_embd;
+ 
+     udata->token     .resize(n_tokens);
+@@ -916,7 +921,7 @@
+             udata->type[i] = is_embd_vec[idxs[i]];
+         }
+ 
+-        if (has_state) {
++        if (has_state && !state_view) {
+             memcpy(udata->embd_state.data() + i*n_embd_state, state_vec.data() + (int64_t) idxs[i]*n_embd_state, n_embd_state*sizeof(float));
+         }
+ 
+@@ -966,7 +971,7 @@
+ 
+         /*.token        =*/ use_token ? udata->token.data() : nullptr,
+         /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
+-        /*.embd_state   =*/ has_state ? udata->embd_state.data() : nullptr,
++        /*.embd_state   =*/ state_view ? state_vec.data() + (int64_t) idxs[0]*n_embd_state : has_state ? udata->embd_state.data() : nullptr,
+         /*.pos          =*/ udata->pos.data(),
+         /*.n_seq_id     =*/ udata->n_seq_id.data(),
+         /*.seq_id       =*/ udata->seq_id.data(),

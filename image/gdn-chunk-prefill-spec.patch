@@ -1,0 +1,43 @@
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index e3c28c07..5e0b3e08 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1024,15 +1024,16 @@ static int gdn_chunk_min_tokens() {
+ }
+ 
+ // the dispatch condition of the chunked prefill path (single source of truth for the op and the q/k-norm fusion)
+-static bool gdn_chunk_eligible_raw(const int cc, const bool kda, const bool keep_rs, const int64_t S_v, const int64_t H,
++static bool gdn_chunk_eligible_raw(const int cc, const bool kda, const int K, const int64_t S_v, const int64_t H,
+         const int64_t Hk, const int64_t n_tokens, const int64_t n_seqs, const int64_t sq1, const int64_t sq2,
+         const void * q_d, const void * k_d) {
+ #if defined(GGML_USE_HIP)
+     const bool aligned = sq1 % 4 == 0 && sq2 % 4 == 0 && ((uintptr_t) q_d) % 16 == 0 && ((uintptr_t) k_d) % 16 == 0;
+-    return !kda && !keep_rs && GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && n_seqs == 1 && n_tokens >= gdn_chunk_min_tokens() &&
++    // with rollback slots (K > 1) a batch longer than K keeps only its final state (slot 0), like the MMA path
++    return !kda && n_tokens > K && GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && n_seqs == 1 && n_tokens >= gdn_chunk_min_tokens() &&
+         aligned && Hk > 0 && H % Hk == 0 && H / Hk <= 4 && gdn_chunk_enabled();
+ #else
+-    GGML_UNUSED(cc); GGML_UNUSED(kda); GGML_UNUSED(keep_rs); GGML_UNUSED(S_v); GGML_UNUSED(H); GGML_UNUSED(Hk);
++    GGML_UNUSED(cc); GGML_UNUSED(kda); GGML_UNUSED(K); GGML_UNUSED(S_v); GGML_UNUSED(H); GGML_UNUSED(Hk);
+     GGML_UNUSED(n_tokens); GGML_UNUSED(n_seqs); GGML_UNUSED(sq1); GGML_UNUSED(sq2); GGML_UNUSED(q_d); GGML_UNUSED(k_d);
+     return false;
+ #endif
+@@ -1046,8 +1047,7 @@ bool ggml_cuda_gdn_chunk_eligible(const ggml_tensor * gdn, const ggml_tensor * q
+     }
+     const int  cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const bool kda     = gdn->src[3]->ne[0] == v->ne[0];
+-    const bool keep_rs = ggml_get_op_params_i32(gdn, 0) > 1;
+-    return gdn_chunk_eligible_raw(cc, kda, keep_rs, v->ne[0], v->ne[1], q->ne[1], v->ne[2], v->ne[3],
++    return gdn_chunk_eligible_raw(cc, kda, ggml_get_op_params_i32(gdn, 0), v->ne[0], v->ne[1], q->ne[1], v->ne[2], v->ne[3],
+         (int64_t) (q->nb[1] / sizeof(float)), (int64_t) (q->nb[2] / sizeof(float)), q->data, k->data);
+ }
+ 
+@@ -1344,7 +1344,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
+         const int cc  = ggml_cuda_info().devices[dev].cc;
+         const float qk_eps = qk_ovr.q ? qk_ovr.eps : -1.0f;
+         const float qk_mul = qk_ovr.q ? qk_ovr.mul : 1.0f;
+-        const bool eligible = gdn_chunk_eligible_raw(cc, kda, keep_rs, S_v, H, neqk1, n_tokens, n_seqs, sq1, sq2, q_d, k_d);
++        const bool eligible = gdn_chunk_eligible_raw(cc, kda, K, S_v, H, neqk1, n_tokens, n_seqs, sq1, sq2, q_d, k_d);
+         if ((qk_ovr.q || on_ovr.z || cv_ovr.x) && !eligible) {
+             GGML_ABORT("gated_delta_net: conv / q/k / output norms were fused for %s but the chunked path is not taken", dst->name);
+         }

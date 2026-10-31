@@ -1,0 +1,135 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 4ffe1ee..3224e20 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1583,8 +1583,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     // MTP input rows of the last process() call: row k pairs batch entry k with the target hidden row of entry k-1, or
+     // with pending_h for the first entry of a sequence. It also holds the rows of the most recent verification batch:
+     // row i of a sequence (0 = the sampled token, i = the ith accepted draft) is h_in[verify_h_beg + i + 1], the last
+-    // one is in verify_h_last.
++    // one is in verify_h_last. h_rows points at these rows: h_in, or for a single sequence the target rows read in place.
+     std::vector<float>   h_in;
++    const float *        h_rows = nullptr;
+     std::vector<int32_t> verify_h_beg;
+     std::vector<int32_t> verify_h_rows;
+     std::vector<std::vector<float>> verify_h_last; // [n_seq][n_embd]
+@@ -1747,14 +1748,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+ 
+-        // one copy of the target rows, shifted down by one entry; the batch below reads them in place
++        // the target rows shifted down by one entry; the batch below reads them in place
+         const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+-        h_in.resize((size_t) n_tokens * n_embd);
+-        std::memcpy(h_in.data() + n_embd, h_tgt, (size_t) (n_tokens - 1) * row_bytes);
++        int32_t n_seq_in = 0;
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-            if (i_batch_beg[seq_id] >= 0) {
+-                std::memcpy(h_in.data() + (size_t) i_batch_beg[seq_id] * n_embd, pending_h[seq_id].data(), row_bytes);
++            n_seq_in += i_batch_beg[seq_id] >= 0;
++        }
++        if (n_seq_in == 1) {
++            // a single sequence: its pending row goes in the spare row in front of the target rows, no copy
++            float * h_shifted = llama_get_embeddings_nextn_shifted(ctx_tgt);
++            std::memcpy(h_shifted, pending_h[batch_in.tokens[0].seq_id].data(), row_bytes);
++            h_rows = h_shifted;
++        } else {
++            h_in.resize((size_t) n_tokens * n_embd);
++            std::memcpy(h_in.data() + n_embd, h_tgt, (size_t) (n_tokens - 1) * row_bytes);
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                if (i_batch_beg[seq_id] >= 0) {
++                    std::memcpy(h_in.data() + (size_t) i_batch_beg[seq_id] * n_embd, pending_h[seq_id].data(), row_bytes);
++                }
+             }
++            h_rows = h_in.data();
+         }
+ 
+         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+@@ -1777,7 +1790,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     ? batch.add(t.id, t.pos[0], seq_id, false)
+                     : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
+ 
+-                batch.set_embd_state(idx, { h_in.data() + (size_t) k * n_embd, 1, (size_t) n_embd });
++                batch.set_embd_state(idx, { h_rows + (size_t) k * n_embd, 1, (size_t) n_embd });
+             }
+ 
+             auto * mem_dft = llama_get_memory(ctx_dft);
+@@ -2040,7 +2053,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+ 
+         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+-        const float * h = i_h < n_rows - 1 ? h_in.data() + (size_t) (verify_h_beg[seq_id] + i_h + 1) * n_embd : verify_h_last[seq_id].data();
++        const float * h = i_h < n_rows - 1 ? h_rows + (size_t) (verify_h_beg[seq_id] + i_h + 1) * n_embd : verify_h_last[seq_id].data();
+         std::memcpy(pending_h[seq_id].data(), h, (size_t) n_embd * sizeof(float));
+     }
+ };
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 55a2c03..a7a37f5 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2484,6 +2484,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+         embd_nextn.size = (size_t) n_embd_out * n_batch;
+     }
+ 
++    // one spare row in front of the nextn rows, see llama_get_embeddings_nextn_shifted
++    const size_t embd_nextn_pad = has_embd_nextn ? n_embd_out : 0;
++
+     for (bool enabled : cparams.embeddings_layer_inp) {
+         if (enabled) {
+             embd_layer_inp_float_count += (size_t) n_embd * n_batch;
+@@ -2504,7 +2507,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+ 
+     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
+     const size_t new_size  =
+-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
++        (logits.size + embd.size + embd_nextn_pad + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+         (                                                                         backend_token_count) * sizeof(llama_token);
+ 
+     // alloc only when more than the current capacity is required
+@@ -2553,6 +2556,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
+     offset += embd.size * sizeof(float);
+ 
++    offset += embd_nextn_pad * sizeof(float);
+     embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
+     offset += embd_nextn.size * sizeof(float);
+ 
+@@ -4519,6 +4523,12 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
+     return ctx->get_embeddings_nextn();
+ }
+ 
++float * llama_get_embeddings_nextn_shifted(llama_context * ctx) {
++    float * embd = llama_get_embeddings_nextn(ctx);
++
++    return embd ? embd - llama_get_model(ctx)->hparams.n_embd_out() : nullptr;
++}
++
+ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index b8c5e80..4f4369d 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -125,6 +125,8 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
+ // mirrors:
+ // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
++// the same rows shifted down by one: row 0 is a spare row the caller may write, row i + 1 is nextn row i
++LLAMA_API float * llama_get_embeddings_nextn_shifted(struct llama_context * ctx);
+ 
+ // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d2db1a3..e4dc22c 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -464,6 +464,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+     ggml_set_input(inp->h);
+     ggml_set_name(inp->h, "mtp_h_input");
++    // device-resident input: the rows are uploaded straight into it rather than staged in host memory first
++    ggml_backend_sched_set_tensor_backend(sched, inp->h, ggml_backend_sched_get_backend(sched, 0));
+ 
+     // the draft's own embeddings if it ships them, else the target's (a shared sidecar)
+     ggml_tensor * tok_embd;

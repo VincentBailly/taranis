@@ -1,0 +1,441 @@
+diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
+index 21053662..13381e31 100644
+--- a/ggml/src/ggml-cuda/hyperconn.cu
++++ b/ggml/src/ggml-cuda/hyperconn.cu
+@@ -427,7 +427,8 @@ __device__ __forceinline__ void hc_store2(uint16_t * p, const float a, const flo
+ }
+ 
+ // One (token, stream) row of the combine + norm; with INJECT it also accumulates the row's share of the next mix's inject projection.
+-template <bool INJECT, bool NT>
++// F32: no BF16 inputs or outputs and the F32 xn stored (decode), so the format checks fold away at compile time.
++template <bool INJECT, bool NT, bool F32 = false>
+ static __device__ __forceinline__ void hc_combine_norm_row_b256(
+         const int c, const int t, const int hc, float * s_sum,
+         const float * inject, const float * residual,
+@@ -442,24 +443,51 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
+     const float w  = s2 * x2 + b2;
+     const int64_t row = (int64_t) t * hc + c;
+     const float *    res   = residual + row * n_embd;
+-    const uint16_t * res16 = res_in_bf16  ? res_in_bf16  + row * n_embd : nullptr;
++    const uint16_t * res16 = !F32 && res_in_bf16  ? res_in_bf16  + row * n_embd : nullptr;
+     float *          dst   = out_res      + row * n_embd;
+-    uint16_t *       dst16 = res_out_bf16 ? res_out_bf16 + row * n_embd : nullptr;
++    uint16_t *       dst16 = !F32 && res_out_bf16 ? res_out_bf16 + row * n_embd : nullptr;
+     const float *    blk   = block_out + (int64_t) t * n_embd;
+-    const uint16_t * blk16 = blk_in_bf16 ? blk_in_bf16 + (int64_t) t * n_embd : nullptr;
++    const uint16_t * blk16 = !F32 && blk_in_bf16 ? blk_in_bf16 + (int64_t) t * n_embd : nullptr;
++    const bool       st_xn = F32 || store_xn_f32;
+     constexpr int KP = (HC_CN_MAX_EMB / 2 + HC_CN_BLOCK2 - 1) / HC_CN_BLOCK2;
+     float xs[2 * KP];
+     float tmp = 0.0f;
++    // issue every load of the row before the first store: the stores could alias the inputs as far as the compiler
++    // knows, which would otherwise serialize one memory round trip per chunk (same values, same arithmetic)
++    float rv[2 * KP], mv[2 * KP];
++    float2 gv[KP];
++    const float * g = gamma + (int64_t) c * n_embd;
++    // (one loop per input format: a format branch inside the loop would wait for each load before the join)
++    auto ld2 = [&](const float * f, const uint16_t * h, float * v) {
++        if (h) {
++#pragma unroll
++            for (int k = 0; k < KP; ++k) {
++                const int col = (tid + k * HC_CN_BLOCK2) * 2;
++                const uint32_t u = col + 1 < n_embd ? *(const uint32_t *)(h + col) : 0u;
++                v[2 * k] = hc_lo(u); v[2 * k + 1] = hc_hi(u);
++            }
++        } else {
++#pragma unroll
++            for (int k = 0; k < KP; ++k) {
++                const int col = (tid + k * HC_CN_BLOCK2) * 2;
++                const float2 u = col + 1 < n_embd ? *(const float2 *)(f + col) : make_float2(0.0f, 0.0f);
++                v[2 * k] = u.x; v[2 * k + 1] = u.y;
++            }
++        }
++    };
++    ld2(res, res16, rv);
++    ld2(blk, blk16, mv);
++#pragma unroll
++    for (int k = 0; k < KP; ++k) {
++        const int col = (tid + k * HC_CN_BLOCK2) * 2;
++        gv[k] = col + 1 < n_embd ? *(const float2 *)(g + col) : make_float2(0.0f, 0.0f);
++    }
+ #pragma unroll
+     for (int k = 0; k < KP; ++k) {
+         const int col = (tid + k * HC_CN_BLOCK2) * 2;
+         xs[2 * k] = 0.0f; xs[2 * k + 1] = 0.0f;
+         if (col + 1 < n_embd) {
+-            float r0, r1, m0, m1;
+-            if (res16) { const uint32_t u = *(const uint32_t *)(res16 + col); r0 = hc_lo(u); r1 = hc_hi(u); }
+-            else       { const float2   v = *(const float2 *)(res + col);     r0 = v.x;      r1 = v.y; }
+-            if (blk16) { const uint32_t u = *(const uint32_t *)(blk16 + col); m0 = hc_lo(u); m1 = hc_hi(u); }
+-            else       { const float2   v = *(const float2 *)(blk + col);     m0 = v.x;      m1 = v.y; }
++            const float r0 = rv[2 * k], r1 = rv[2 * k + 1], m0 = mv[2 * k], m1 = mv[2 * k + 1];
+             const float a0 = hc_add_rn(r0, hc_mul_rn(m0, w));
+             const float a1 = hc_add_rn(r1, hc_mul_rn(m1, w));
+             if (dst16) hc_store2<NT>(dst16 + col, a0, a1);
+@@ -478,16 +506,14 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
+     tmp = block_reduce<block_reduce_method::SUM, HC_CN_BLOCK2>(tmp, s_sum);
+     const float mean  = tmp / n_embd;
+     const float scale = rsqrtf(mean + eps);
+-    const float * g  = gamma  + (int64_t) c * n_embd;
+     float *       xn = out_xn + row * n_embd;
+-    uint16_t *    xh = out_xn_bf16 ? out_xn_bf16 + row * n_embd : nullptr;
++    uint16_t *    xh = !F32 && out_xn_bf16 ? out_xn_bf16 + row * n_embd : nullptr;
+ #pragma unroll
+     for (int k = 0; k < KP; ++k) {
+         const int col = (tid + k * HC_CN_BLOCK2) * 2;
+         if (col + 1 < n_embd) {
+-            const float2 gv = *(const float2 *)(g + col);
+-            const float v0 = scale * xs[2 * k] * gv.x, v1 = scale * xs[2 * k + 1] * gv.y;
+-            if (store_xn_f32) *(float2 *)(xn + col) = make_float2(v0, v1);
++            const float v0 = scale * xs[2 * k] * gv[k].x, v1 = scale * xs[2 * k + 1] * gv[k].y;
++            if (st_xn) *(float2 *)(xn + col) = make_float2(v0, v1);
+             if (q8) {
+                 // a half warp holds 32 consecutive values as pairs (n_embd % 64 == 0, so whole warps are in range)
+                 quantize_q8_1_pairs(v0, v1, q8 + (row * n_embd + col) / QK8_1, tid % 16);
+@@ -502,7 +528,7 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
+             }
+         } else if (col < n_embd) {
+             const float v0 = scale * xs[2 * k] * g[col];
+-            if (store_xn_f32) xn[col] = v0;
++            if (st_xn) xn[col] = v0;
+             if (xh) xh[col] = hc_f2bf32(v0);
+             if constexpr (INJECT) {
+ #pragma unroll
+@@ -514,7 +540,7 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
+     }
+ }
+ 
+-template <bool NT>
++template <bool NT, bool F32>
+ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b256(
+         const float * inject, const float * residual,
+         const float * block_out, const float * gamma,
+@@ -522,7 +548,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
+         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
+         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps, block_q8_1 * q8) {
+     __shared__ float s_sum[32];
+-    hc_combine_norm_row_b256<false, NT>(blockIdx.x, blockIdx.y, gridDim.x, s_sum, inject, residual, block_out, gamma,
++    hc_combine_norm_row_b256<false, NT, F32>(blockIdx.x, blockIdx.y, gridDim.x, s_sum, inject, residual, block_out, gamma,
+         out_res, out_xn, out_xn_bf16, store_xn_f32, res_in_bf16, res_out_bf16, blk_in_bf16,
+         n_embd, s1, b1, s2, b2, eps, nullptr, nullptr, q8);
+ }
+@@ -613,7 +639,9 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
+ 
+     // 256 threads x 2 packed elements per iteration (the shipped layout); the BF16 options ride on this kernel
+     const ggml_cuda_kernel_launch_params lp2(dim3((int) hc, (int) n_tokens, 1), HC_CN_BLOCK2, 0, ctx.stream());
+-    ggml_cuda_kernel_launch(nt ? hc_combine_norm_f32_b256<true> : hc_combine_norm_f32_b256<false>, lp2,
++    const bool f32 = a.store_xn_f32 && !a.out_xn_bf16 && !a.res_in_bf16 && !a.res_out_bf16 && !a.blk_in_bf16;
++    ggml_cuda_kernel_launch(nt ? (f32 ? hc_combine_norm_f32_b256<true, true>  : hc_combine_norm_f32_b256<true, false>)
++                               : (f32 ? hc_combine_norm_f32_b256<false, true> : hc_combine_norm_f32_b256<false, false>), lp2,
+         (const float *) a.inject->data, (const float *) a.residual->data,
+         (const float *) a.block_out->data, (const float *) a.gamma->data,
+         (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index ad2c4969..ca100147 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -5,7 +5,8 @@
+ #include "mmf.cuh"
+ #include "convert.cuh"
+ 
+-template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, bool tokens_in_block = false>
++// pfd > 0: grids of a few blocks (latency bound): every K iteration loads pfd chunks ahead, the tail included
++template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, bool tokens_in_block = false, int pfd = 0>
+ static __global__ void mul_mat_vec_f(
+         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
+@@ -138,11 +139,38 @@ static __global__ void mul_mat_vec_f(
+ 
+         int col2 = tid;
+ #if defined(GGML_USE_HIP)
++        if constexpr (pfd > 0 && !has_fusion) {
++            for (; col2 < ncols2; col2 += pfd*block_size) {
++                float2 tmpx[pfd];
++                float2 tmpy[pfd][ncols_dst];
++#pragma unroll
++                for (int i = 0; i < pfd; ++i) {
++                    tmpx[i] = col2 + i*block_size < ncols2 ? x2[col2 + i*block_size] : make_float2(0.0f, 0.0f);
++                }
++#pragma unroll
++                for (int i = 0; i < pfd; ++i) {
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) {
++                        tmpy[i][j] = col2 + i*block_size < ncols2 ? y2[j*stride_col_y2 + col2 + i*block_size] : make_float2(0.0f, 0.0f);
++                    }
++                }
++#pragma unroll
++                for (int i = 0; i < pfd; ++i) {
++                    if (col2 + i*block_size < ncols2) {
++#pragma unroll
++                        for (int j = 0; j < ncols_dst; ++j) {
++                            ggml_cuda_mad(sumf[j], tmpx[i].x, tmpy[i][j].x);
++                            ggml_cuda_mad(sumf[j], tmpx[i].y, tmpy[i][j].y);
++                        }
++                    }
++                }
++            }
++        }
+         // Issue the weight loads of four K iterations before consuming them: the runtime trip count keeps the
+         // compiler from pipelining the loop, and with one 8-byte load in flight per lane the single-column
+         // f32 matvecs (e.g. MoE routers) reach barely half the memory bandwidth. The accumulation order is
+         // unchanged, so the results are bit-identical.
+-        if constexpr (ncols_dst <= 4 && !has_fusion) {
++        if constexpr (ncols_dst <= 4 && !has_fusion && pfd == 0) {
+             constexpr int pf = 4;
+             for (; col2 + (pf - 1)*block_size < ncols2; col2 += pf*block_size) {
+                 float2 tmpx[pf];
+@@ -279,9 +307,38 @@ static __global__ void mul_mat_vec_f(
+             }
+         }
+         int col2 = tid;
++        if constexpr (pfd > 0 && !has_fusion) {
++            for (; col2 < ncols2; col2 += pfd*block_size) {
++                int    tmpx[pfd];
++                float2 tmpy[pfd][ncols_dst];
++#pragma unroll
++                for (int i = 0; i < pfd; ++i) {
++                    tmpx[i] = col2 + i*block_size < ncols2 ? x2[col2 + i*block_size] : 0;
++                }
++#pragma unroll
++                for (int i = 0; i < pfd; ++i) {
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) {
++                        tmpy[i][j] = col2 + i*block_size < ncols2 ? y2[j*stride_col_y2 + col2 + i*block_size] : make_float2(0.0f, 0.0f);
++                    }
++                }
++#pragma unroll
++                for (int i = 0; i < pfd; ++i) {
++                    if (col2 + i*block_size < ncols2) {
++                        const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx[i])[0]);
++                        const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx[i])[1]);
++#pragma unroll
++                        for (int j = 0; j < ncols_dst; ++j) {
++                            ggml_cuda_mad(sumf[j], tmpx0, tmpy[i][j].x);
++                            ggml_cuda_mad(sumf[j], tmpx1, tmpy[i][j].y);
++                        }
++                    }
++                }
++            }
++        }
+         // same prefetching as the f32 path above (bit-identical; the small hyper-connection and gate
+         // projections of multi-token batches are latency bound with one load in flight per lane)
+-        if constexpr (ncols_dst <= 4 && !has_fusion) {
++        if constexpr (ncols_dst <= 4 && !has_fusion && pfd == 0) {
+             constexpr int pf = 4;
+             for (; col2 + (pf - 1)*block_size < ncols2; col2 += pf*block_size) {
+                 int    tmpx[pf];
+@@ -546,6 +603,21 @@ static void mul_mat_vec_f_switch_fusion(
+ 
+     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+ 
++#if defined(GGML_USE_HIP)
++    // a grid of fewer blocks than CUs (e.g. the hyper-connection inject and shared-expert gate projections of a
++    // decode batch) is latency bound: load deeper ahead, same accumulation order
++    if constexpr ((std::is_same_v<T, float> || std::is_same_v<T, nv_bfloat16>) && ncols_dst <= 4 && block_size == 256 &&
++                  !is_multi_token_id && !tokens_in_block) {
++        if ((int64_t) block_nums.x * block_nums.y * block_nums.z < ggml_cuda_info().devices[ggml_cuda_get_device()].nsm) {
++            ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, false, 10>, launch_params,
++                x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
++                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++            return;
++        }
++    }
++#endif // defined(GGML_USE_HIP)
++
+     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id, tokens_in_block>, launch_params,
+         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index 6f954d87..2ad7474e 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -525,6 +525,122 @@ static __global__ void __launch_bounds__(TOPK_WG_THREADS) top_k_wg_kernel(
+         }
+     }
+ }
++
++// A few long rows and a small k (e.g. the MTP draft sampler's top-k over the full vocabulary): every thread keeps
++// the TOPK_SMALL_MAXK best (key, column) pairs of its columns, each block takes its k best, one block per row merges
++// them. Same set and order as the stable-tie radix path when its atomic gather runs in column order.
++#define TOPK_SMALL_MAXK    16
++#define TOPK_SMALL_THREADS 256
++
++// larger is better: higher key, then lower column; 0 is never a real entry (~col has the top bit set)
++static __device__ __forceinline__ uint64_t top_k_small_pack(const uint32_t key, const int col) {
++    return ((uint64_t) key << 32) | (uint32_t) ~col;
++}
++
++static __device__ __forceinline__ void top_k_small_insert(uint64_t (&l)[TOPK_SMALL_MAXK], const uint64_t c) {
++    if (c <= l[TOPK_SMALL_MAXK - 1]) {
++        return;
++    }
++#pragma unroll
++    for (int i = TOPK_SMALL_MAXK - 1; i > 0; --i) {
++        l[i] = c < l[i] ? l[i] : (c < l[i - 1] ? c : l[i - 1]);
++    }
++    l[0] = c < l[0] ? l[0] : c;
++}
++
++// k rounds of a block-wide max over the list heads; thread 0 gets the winners in out[0..k)
++static __device__ void top_k_small_select(uint64_t (&l)[TOPK_SMALL_MAXK], const int k, uint64_t * out) {
++    __shared__ uint64_t s_max[TOPK_SMALL_THREADS / 32];
++    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
++    for (int r = 0; r < k; ++r) {
++        uint64_t m = l[0];
++#pragma unroll
++        for (int off = 16; off > 0; off >>= 1) {
++            const uint64_t o = __shfl_xor(m, off, 32);
++            m = o > m ? o : m;
++        }
++        if (lane == 0) {
++            s_max[warp] = m;
++        }
++        __syncthreads();
++        m = s_max[0];
++#pragma unroll
++        for (int w = 1; w < TOPK_SMALL_THREADS / 32; ++w) {
++            m = s_max[w] > m ? s_max[w] : m;
++        }
++        __syncthreads();
++        if (m != 0 && l[0] == m) {
++#pragma unroll
++            for (int i = 0; i < TOPK_SMALL_MAXK - 1; ++i) {
++                l[i] = l[i + 1];
++            }
++            l[TOPK_SMALL_MAXK - 1] = 0;
++        }
++        if (threadIdx.x == 0) {
++            out[r] = m;
++        }
++    }
++}
++
++static __global__ void __launch_bounds__(TOPK_SMALL_THREADS) top_k_small_partial(
++        const float * __restrict__ src, uint64_t * __restrict__ part, const int ncols, const int k) {
++    const int row = blockIdx.y, nb = gridDim.x;
++    const float * x = src + (size_t) row * ncols;
++    uint64_t l[TOPK_SMALL_MAXK];
++#pragma unroll
++    for (int i = 0; i < TOPK_SMALL_MAXK; ++i) {
++        l[i] = 0;
++    }
++    const int chunk = (ncols + nb - 1) / nb;
++    const int c0 = blockIdx.x * chunk, c1 = min(ncols, c0 + chunk);
++    int c = c0 + threadIdx.x;
++    for (; c + 3 * TOPK_SMALL_THREADS < c1; c += 4 * TOPK_SMALL_THREADS) {
++        const float v0 = x[c], v1 = x[c + TOPK_SMALL_THREADS], v2 = x[c + 2 * TOPK_SMALL_THREADS], v3 = x[c + 3 * TOPK_SMALL_THREADS];
++        top_k_small_insert(l, top_k_small_pack(top_k_float_to_ordered(v0), c));
++        top_k_small_insert(l, top_k_small_pack(top_k_float_to_ordered(v1), c + TOPK_SMALL_THREADS));
++        top_k_small_insert(l, top_k_small_pack(top_k_float_to_ordered(v2), c + 2 * TOPK_SMALL_THREADS));
++        top_k_small_insert(l, top_k_small_pack(top_k_float_to_ordered(v3), c + 3 * TOPK_SMALL_THREADS));
++    }
++    for (; c < c1; c += TOPK_SMALL_THREADS) {
++        top_k_small_insert(l, top_k_small_pack(top_k_float_to_ordered(x[c]), c));
++    }
++    top_k_small_select(l, k, part + ((size_t) row * nb + blockIdx.x) * k);
++}
++
++static __global__ void __launch_bounds__(TOPK_SMALL_THREADS) top_k_small_merge(
++        const uint64_t * __restrict__ part, int * __restrict__ dst, const int nb, const int k) {
++    const int row = blockIdx.x;
++    const uint64_t * p = part + (size_t) row * nb * k;
++    uint64_t l[TOPK_SMALL_MAXK];
++#pragma unroll
++    for (int i = 0; i < TOPK_SMALL_MAXK; ++i) {
++        l[i] = 0;
++    }
++    for (int i = threadIdx.x; i < nb * k; i += TOPK_SMALL_THREADS) {
++        top_k_small_insert(l, p[i]);
++    }
++    __shared__ uint64_t s_out[TOPK_SMALL_MAXK];
++    top_k_small_select(l, k, s_out);
++    if (threadIdx.x == 0) {
++        // the radix path's order: keys above the k-th key first, then the ties with it, each by increasing column
++        const uint32_t kth = (uint32_t) (s_out[k - 1] >> 32);
++        int n = 0;
++        for (int pass = 0; pass < 2; ++pass) {
++            const int n0 = n;
++            for (int i = 0; i < k; ++i) {
++                const uint32_t key = (uint32_t) (s_out[i] >> 32);
++                if (pass == 0 ? key > kth : key == kth) {
++                    const int col = (int) ~(uint32_t) s_out[i];
++                    int j = n++;
++                    for (; j > n0 && dst[(size_t) row * k + j - 1] > col; --j) {
++                        dst[(size_t) row * k + j] = dst[(size_t) row * k + j - 1];
++                    }
++                    dst[(size_t) row * k + j] = col;
++                }
++            }
++        }
++    }
++}
+ #endif // defined(GGML_USE_HIP)
+ 
+ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -560,6 +676,15 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+             CUDA_CHECK(cudaGetLastError());
+             return;
+         }
++        if (nrows <= 32 && ncols > 16384 && k <= TOPK_SMALL_MAXK && ncols <= INT_MAX &&
++                GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) {
++            const int nb = (int) std::min<int64_t>(64, (ncols + 4095) / 4096);
++            ggml_cuda_pool_alloc<uint64_t> part(pool, (size_t) nrows * nb * k);
++            top_k_small_partial<<<dim3(nb, (unsigned) nrows), TOPK_SMALL_THREADS, 0, stream>>>(src0_d, part.get(), (int) ncols, (int) k);
++            top_k_small_merge<<<(unsigned) nrows, TOPK_SMALL_THREADS, 0, stream>>>(part.get(), dst_d, nb, (int) k);
++            CUDA_CHECK(cudaGetLastError());
++            return;
++        }
+     }
+ #endif // defined(GGML_USE_HIP)
+ 
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index b7efe360..177a588c 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -31,7 +31,7 @@
+ #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
+ #define __shfl_sync(mask, var, laneMask, width) __shfl(var, laneMask, width)
+ #define __shfl_up_sync(mask, var, laneMask, width) __shfl_up(var, laneMask, width)
+-#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
++#define __shfl_xor_sync(mask, var, laneMask, width) ggml_hip_shfl_xor(var, laneMask, width)
+ #define __all_sync(mask, var) __all(var)
+ #define __any_sync(mask, var) __any(var)
+ #define cublasStrsmBatched hipblasStrsmBatched
+@@ -316,3 +316,36 @@ static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigne
+ 
+     return (ne_any_bit >> 7) * 0xff;
+ }
++
++// __shfl_xor_sync for the butterfly reductions: on RDNA3 (wave32) the constant xor masks 1..16 map to DPP moves and
++// v_permlanex16 instead of a ds_bpermute LDS round trip. Same values as __shfl_xor, which reads 0 from inactive lanes.
++template <typename T>
++static __device__ __forceinline__ T ggml_hip_shfl_xor(const T var, const int lane_mask, const int width) {
++#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__)
++    if constexpr (sizeof(T) == 4 || sizeof(T) == 8) {
++        if (__builtin_amdgcn_wavefrontsize() != 32) {
++            return __shfl_xor(var, lane_mask, width);
++        }
++        if (lane_mask >= width) {
++            return var;   // the source lane is outside the segment: __shfl_xor returns the own value
++        }
++        auto x32 = [lane_mask](const int v) -> int {
++            switch (lane_mask) {
++                case  1: return __builtin_amdgcn_update_dpp(0, v, 0xB1,  0xF, 0xF, true);   // quad_perm:[1,0,3,2]
++                case  2: return __builtin_amdgcn_update_dpp(0, v, 0x4E,  0xF, 0xF, true);   // quad_perm:[2,3,0,1]
++                case  4: return __builtin_amdgcn_update_dpp(0, v, 0x164, 0xF, 0xF, true);   // row_xmask:4
++                case  8: return __builtin_amdgcn_update_dpp(0, v, 0x168, 0xF, 0xF, true);   // row_xmask:8
++                case 16: return __builtin_amdgcn_permlanex16(0, v, 0x76543210, 0xfedcba98, false, false);
++                default: return __shfl_xor(v, lane_mask, 32);
++            }
++        };
++        if constexpr (sizeof(T) == 4) {
++            return __builtin_bit_cast(T, x32(__builtin_bit_cast(int, var)));
++        } else {
++            const int2 v = __builtin_bit_cast(int2, var);
++            return __builtin_bit_cast(T, make_int2(x32(v.x), x32(v.y)));
++        }
++    }
++#endif
++    return __shfl_xor(var, lane_mask, width);
++}

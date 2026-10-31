@@ -1,0 +1,61 @@
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7168,23 +7168,41 @@
+     return h == GGML_HASHSET_FULL || !ggml_bitset_get(g->visited_hash_set.used, h) ? -1 : g->use_counts[h];
+ }
+ 
++// per graph_optimize call: the views of each tensor among the nodes, and the source slots reading it or one of its views
++struct ggml_cuda_marks_index {
++    const ggml_cgraph * g = nullptr;
++    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> views;
++    std::unordered_map<const ggml_tensor *, int> found;
++};
++static thread_local ggml_cuda_marks_index ggml_cuda_marks_idx;
++
+ // uses of x (and of its views present in this split) that no node of this split accounts for; -1 when unknown
+ static int ggml_cuda_marks_readers_left(const ggml_cgraph * g, const ggml_tensor * x) {
+-    int expected = ggml_cuda_marks_uses(g, x), found = 0;
++    int expected = ggml_cuda_marks_uses(g, x);
+     if (expected < 0) return -1;
+-    for (int i = 0; i < g->n_nodes; ++i) {
+-        const ggml_tensor * t = g->nodes[i];
+-        if (t != x && ggml_cuda_marks_is_view(t) && t->view_src == x) {
++    auto & idx = ggml_cuda_marks_idx;
++    if (idx.g != g) {
++        idx.g = g; idx.views.clear(); idx.found.clear();
++        for (int i = 0; i < g->n_nodes; ++i) {
++            const ggml_tensor * t = g->nodes[i];
++            if (ggml_cuda_marks_is_view(t) && t->view_src && t->view_src != t) idx.views[t->view_src].push_back(t);
++            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
++                const ggml_tensor * src = t->src[s];
++                ++idx.found[src];
++                if (ggml_cuda_marks_is_view(src) && src->view_src) ++idx.found[src->view_src];
++            }
++        }
++    }
++    const auto v = idx.views.find(x);
++    if (v != idx.views.end()) {
++        for (const ggml_tensor * t : v->second) {
+             const int u = ggml_cuda_marks_uses(g, t);
+             if (u < 0) return -1;
+             expected += u;
+         }
+-        for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+-            const ggml_tensor * src = t->src[s];
+-            if (src == x || (ggml_cuda_marks_is_view(src) && src->view_src == x)) ++found;
+-        }
+     }
+-    return expected - found;
++    const auto f = idx.found.find(x);
++    return expected - (f == idx.found.end() ? 0 : f->second);
+ }
+ 
+ static bool ggml_cuda_marks_readers_local(const ggml_cgraph * g, const ggml_tensor * x) {
+@@ -7193,6 +7211,7 @@
+ 
+ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_marks_idx.g = nullptr;   // the reader index is built for this graph on first use (after any reordering below)
+     {   // marks live for the whole scheduled graph (all splits): clear at the first optimize after a compute, or when the first split repeats
+         const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
+         if (cuda_ctx->mmb_after_compute || cuda_ctx->mmb_first_split == nullptr || key == cuda_ctx->mmb_first_split) { ggml_cuda_mmb_marks_clear(*cuda_ctx); cuda_ctx->mmb_graph_sigs.clear(); cuda_ctx->mmb_res16_pending.clear(); cuda_ctx->mmb_first_split = key; cuda_ctx->mmb_after_compute = false; }

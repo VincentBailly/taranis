@@ -1,0 +1,433 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 15d1918..63312de 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -858,18 +858,56 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
+     return GGML_STATUS_SUCCESS;
+ }
+ 
++// Buffer memsets (e.g. the KV cells wiped by each sequence removal, many small ones per call) are queued on a
++// per-device stream without a host sync each; other work on the device waits for them through an event.
++struct ggml_cuda_pending_memsets {
++    std::mutex   mutex;
++    cudaStream_t stream  = nullptr;
++    cudaEvent_t  event   = nullptr;
++    bool         pending = false;
++};
++
++static ggml_cuda_pending_memsets & ggml_cuda_get_pending_memsets(int device) {
++    static ggml_cuda_pending_memsets pm[GGML_CUDA_MAX_DEVICES];
++    return pm[ggml_cuda_get_physical_device(device)];
++}
++
++static void ggml_cuda_wait_pending_memsets(int device, cudaStream_t stream) {
++    ggml_cuda_pending_memsets & pm = ggml_cuda_get_pending_memsets(device);
++    std::lock_guard<std::mutex> lock(pm.mutex);
++    if (pm.pending) {
++        const cudaError_t err = cudaEventQuery(pm.event);
++        if (err == cudaSuccess) {
++            pm.pending = false; // done, nothing to wait for on any stream
++        } else {
++            if (err != cudaErrorNotReady) {
++                CUDA_CHECK(err);
++            }
++            CUDA_CHECK(cudaStreamWaitEvent(stream, pm.event, 0));
++        }
++    }
++}
++
+ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
+-    CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    ggml_cuda_pending_memsets & pm = ggml_cuda_get_pending_memsets(ctx->device);
++    std::lock_guard<std::mutex> lock(pm.mutex);
++    if (pm.stream == nullptr) {
++        CUDA_CHECK(cudaStreamCreateWithFlags(&pm.stream, cudaStreamNonBlocking));
++        CUDA_CHECK(cudaEventCreateWithFlags(&pm.event, cudaEventDisableTiming));
++    }
++    CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, pm.stream));
++    CUDA_CHECK(cudaEventRecord(pm.event, pm.stream));
++    pm.pending = true;
+ }
+ 
+ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_wait_pending_memsets(ctx->device, cudaStreamPerThread);
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+@@ -878,6 +916,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_wait_pending_memsets(ctx->device, cudaStreamPerThread);
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+@@ -887,6 +926,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_wait_pending_memsets(ctx->device, cudaStreamPerThread);
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+@@ -897,6 +937,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_wait_pending_memsets(ctx->device, cudaStreamPerThread);
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+@@ -910,6 +951,8 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+         // in which case a same-device copy (not a peer copy) is required
+         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
+         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
++        ggml_cuda_wait_pending_memsets(src_ctx->device, cudaStreamPerThread);
++        ggml_cuda_wait_pending_memsets(dst_ctx->device, cudaStreamPerThread);
+         if (src_physical == dst_physical) {
+             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+         } else {
+@@ -931,6 +974,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_wait_pending_memsets(ctx->device, cudaStreamPerThread);
+     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+@@ -2653,6 +2697,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    ggml_cuda_wait_pending_memsets(cuda_ctx->device, cuda_ctx->stream());
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+ 
+@@ -2662,6 +2707,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    ggml_cuda_wait_pending_memsets(cuda_ctx->device, cuda_ctx->stream());
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+ 
+@@ -2672,6 +2718,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    ggml_cuda_wait_pending_memsets(cuda_ctx->device, cuda_ctx->stream());
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+@@ -2683,6 +2730,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    ggml_cuda_wait_pending_memsets(cuda_ctx->device, cuda_ctx->stream());
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+@@ -2713,6 +2761,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+         return false;
+     }
+ 
++    ggml_cuda_wait_pending_memsets(cuda_ctx_src->device, cuda_ctx_src->stream());
++    ggml_cuda_wait_pending_memsets(cuda_ctx_dst->device, cuda_ctx_src->stream());
++
+     if (backend_src != backend_dst) {
+         // copy on src stream
+         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
+@@ -2749,6 +2800,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
++    ggml_cuda_wait_pending_memsets(cuda_ctx->device, cuda_ctx->stream());
+     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+ 
+     GGML_UNUSED(backend);
+@@ -6921,6 +6973,8 @@ static uint64_t ggml_cuda_graph_sig(const ggml_cgraph * cgraph) {
+ 
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    ggml_cuda_wait_pending_memsets(cuda_ctx->device, cuda_ctx->stream());
+     if (ggml_cuda_mmb_marks_count(*cuda_ctx) > 0) {
+         const uint64_t sig = ggml_cuda_graph_sig(cgraph);
+         if (std::find(cuda_ctx->mmb_graph_sigs.begin(), cuda_ctx->mmb_graph_sigs.end(), sig) == cuda_ctx->mmb_graph_sigs.end()) {
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index cd9b10d..6aeb993 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -697,6 +697,117 @@ static __global__ void mul_mat_vec_q4_columns(
+     }
+ }
+ 
++#if defined(GGML_USE_HIP)
++// Q8_0 x Q8_1 for 2..4 columns on RDNA3.5 when the batch need not match single columns bit for bit
++// (GGML_HINT_EXACT_BATCH unset). Per-lane 2-byte weight loads and per-column 4-byte activation loads leave the
++// exact kernels bound by the texture-address unit on small matrices. Here each lane reads 16 weight bytes and
++// 16 activation bytes per column with single loads (unaligned loads are fine on AMD), and matrices with few
++// rows split K over c_nwarps warps.
++template <int c_ncols, int c_nwarps>
++__launch_bounds__(c_nwarps * ggml_cuda_get_physical_warp_size(), 1)
++static __global__ void mul_mat_vec_q8_0_columns_rdna3_5(
++        const void * vx_ptr, const void * vy_ptr, float * dst_ptr,
++        const uint32_t ncols_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
++        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
++        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
++        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr int blocks_per_iter = c_nwarps * warp_size / 2;
++
++    const int row  = blockIdx.x;
++    const int lane = threadIdx.x;
++    const int half = lane % 2;
++    const uint32_t channel_dst = blockIdx.y;
++    const uint32_t sample_dst  = blockIdx.z;
++    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
++    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
++
++    const block_q8_0 * x = (const block_q8_0 *) vx_ptr + sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
++    const block_q8_1 * y = (const block_q8_1 *) vy_ptr + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
++    float * dst = dst_ptr + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row;
++
++    const int blocks_per_row_x = ncols_x / QK8_0;
++    float tmp[c_ncols] = {0.0f};
++
++    for (int kb = threadIdx.y*(warp_size/2) + lane/2; kb < blocks_per_row_x; kb += blocks_per_iter) {
++        const int4  xv = *(const int4 *) (x[kb].qs + 16*half);
++        const float dx = __half2float(x[kb].d);
++#pragma unroll
++        for (int j = 0; j < c_ncols; ++j) {
++            const block_q8_1 * by = &y[j*stride_col_y + kb];
++            const int4 yv = *(const int4 *) (by->qs + 16*half);
++            int sumi = ggml_cuda_dp4a(xv.x, yv.x, 0);
++            sumi = ggml_cuda_dp4a(xv.y, yv.y, sumi);
++            sumi = ggml_cuda_dp4a(xv.z, yv.z, sumi);
++            sumi = ggml_cuda_dp4a(xv.w, yv.w, sumi);
++            tmp[j] += dx * __low2float(by->ds) * (float) sumi;
++        }
++    }
++
++#pragma unroll
++    for (int j = 0; j < c_ncols; ++j) {
++        tmp[j] = warp_reduce_sum<warp_size>(tmp[j]);
++    }
++    if constexpr (c_nwarps > 1) {
++        __shared__ float s_sum[c_nwarps][c_ncols];
++        if (lane == 0) {
++#pragma unroll
++            for (int j = 0; j < c_ncols; ++j) {
++                s_sum[threadIdx.y][j] = tmp[j];
++            }
++        }
++        __syncthreads();
++        if (threadIdx.y != 0) {
++            return;
++        }
++#pragma unroll
++        for (int j = 0; j < c_ncols; ++j) {
++            tmp[j] = 0.0f;
++#pragma unroll
++            for (int w = 0; w < c_nwarps; ++w) {
++                tmp[j] += s_sum[w][j];
++            }
++        }
++    }
++    if (lane == 0) {
++#pragma unroll
++        for (int j = 0; j < c_ncols; ++j) {
++            dst[j*stride_col_dst] = tmp[j];
++        }
++    }
++}
++
++// returns false if the batch is not handled here
++static bool mul_mat_vec_q8_0_columns(
++        const void * vx, const void * vy, float * dst, const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_dst,
++        const int64_t stride_row_x, const int64_t stride_col_y, const int64_t stride_col_dst,
++        const int64_t nchannels_x, const int64_t nchannels_dst, const int64_t stride_channel_x, const int64_t stride_channel_y,
++        const int64_t stride_channel_dst, const int64_t nsamples_x, const int64_t nsamples_dst, const int64_t stride_sample_x,
++        const int64_t stride_sample_y, const int64_t stride_sample_dst, cudaStream_t stream) {
++    const auto & info = ggml_cuda_info().devices[ggml_cuda_get_device()];
++    if (!GGML_CUDA_CC_IS_RDNA3_5(info.cc) || info.warp_size != 32 || ncols_dst < 2 || ncols_dst > 4) {
++        return false;
++    }
++    // fewer than 512 rows: split K over 4 warps to keep the GPU busy
++    const bool split_k = nrows_x*nchannels_dst*nsamples_dst < 512;
++    const dim3 block_nums(nrows_x, nchannels_dst, nsamples_dst);
++    const dim3 block_dims(32, split_k ? 4 : 1, 1);
++    const uint3 channel_ratio = init_fastdiv_values(nchannels_dst / nchannels_x);
++    const uint3 sample_ratio  = init_fastdiv_values(nsamples_dst / nsamples_x);
++    const auto launch = [&](auto kernel) {
++        kernel<<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, stride_row_x, stride_col_y, stride_col_dst,
++            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
++    };
++    switch (ncols_dst) {
++        case 2:  split_k ? launch(mul_mat_vec_q8_0_columns_rdna3_5<2, 4>) : launch(mul_mat_vec_q8_0_columns_rdna3_5<2, 1>); break;
++        case 3:  split_k ? launch(mul_mat_vec_q8_0_columns_rdna3_5<3, 4>) : launch(mul_mat_vec_q8_0_columns_rdna3_5<3, 1>); break;
++        default: split_k ? launch(mul_mat_vec_q8_0_columns_rdna3_5<4, 4>) : launch(mul_mat_vec_q8_0_columns_rdna3_5<4, 1>); break;
++    }
++    return true;
++}
++#endif // defined(GGML_USE_HIP)
++
+ template <ggml_type type>
+ __launch_bounds__(calc_nwarps(type, 1, get_device_table_id()) * ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
+@@ -3449,6 +3560,17 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
++#if defined(GGML_USE_HIP)
++    const bool exact_batch = ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH;
++    const bool no_fusion = fusion_local.gate == nullptr && fusion_local.x_bias == nullptr && fusion_local.gate_bias == nullptr &&
++        fusion_local.x_scale == nullptr && fusion_local.gate_scale == nullptr && fusion_local.shared_up == nullptr;
++    if (src0->type == GGML_TYPE_Q8_0 && ids == nullptr && no_fusion && !exact_batch &&
++            mul_mat_vec_q8_0_columns(src0->data, src1_q8_1.get(), dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
++                ne02, nchannels_dst, s02, stride_channel_y, stride_channel_dst, ne03, ne3, s03, s13, s3, stream)) {
++        return;
++    }
++#endif // defined(GGML_USE_HIP)
++
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index dabda9c..b7efe36 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -59,9 +59,11 @@
+ #define cudaError_t hipError_t
+ #define cudaErrorMemoryAllocation hipErrorOutOfMemory
+ #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
++#define cudaErrorNotReady hipErrorNotReady
+ #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
+ #define cudaEventCreateWithFlags hipEventCreateWithFlags
+ #define cudaEventDisableTiming hipEventDisableTiming
++#define cudaEventQuery hipEventQuery
+ #define cudaEventRecord hipEventRecord
+ #define cudaEventSynchronize hipEventSynchronize
+ #define cudaEvent_t hipEvent_t
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index c900895..2b83322 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -451,7 +451,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+ 
+         std::vector<uint32_t> freed;
+ 
+-        for (uint32_t i = 0; i < cells.size(); ++i) {
++        // nothing of the sequence at or after p0
++        if (cells.seq_pos_max(seq_id) < p0) {
++            return true;
++        }
++
++        // cells outside [used_min, used_max_p1) are empty
++        const uint32_t i_end = cells.used_max_p1();
++        for (uint32_t i = cells.used_min(); i < i_end; ++i) {
+             if (!cells.pos_in(i, p0, p1)) {
+                 continue;
+             }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index f3d6e7c..3c5f825 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1117,9 +1117,16 @@ static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_
+ // row of its own sequence, so one graph serves several sequences without a mask. A block is visible to a query
+ // iff its start < the query's tail start. log(step(.)) is 0 or -inf. With n_seq=1 this is the old single-seq
+ // layout (row_idx all 0) and produces byte-identical scores.
++// memo: the visibility term only depends on the strip and the score shape, so layers sharing the inputs share it
++// (built once instead of once per layer, and the views of limits are copied to the device once)
+ static ggml_tensor * qwen4exp_apply_compact_visibility(ggml_context *ctx,ggml_tensor *score,
+-        ggml_tensor *limits,int64_t blocks,int64_t n_seq,int64_t n_tps,int64_t first,int64_t queries) {
++        ggml_tensor *limits,int64_t blocks,int64_t n_seq,int64_t n_tps,int64_t first,int64_t queries,
++        std::map<std::array<int64_t, 3>, ggml_tensor *> & memo) {
+     GGML_ASSERT(limits->type==GGML_TYPE_I32 && score->ne[0]<=blocks && score->ne[1]==queries && score->ne[2]==1);
++    ggml_tensor *& log_visible = memo[{first, queries, score->ne[0]}];
++    if (log_visible != nullptr) {
++        return ggml_add(ctx,score,log_visible);
++    }
+     // one row is broadcast over the queries; several rows are cast first (n_seq x blocks) and then gathered per
+     // query, so no pass over the full [blocks, queries] tensor is added
+     ggml_tensor * starts = nullptr;
+@@ -1133,7 +1140,8 @@ static ggml_tensor * qwen4exp_apply_compact_visibility(ggml_context *ctx,ggml_te
+     auto *tails=ggml_cast(ctx,ggml_view_1d(ctx,limits,queries,(blocks*n_seq+first)*sizeof(int32_t)),GGML_TYPE_F32);
+     tails=ggml_reshape_2d(ctx,tails,1,queries);
+     auto *visible=ggml_step(ctx,ggml_sub(ctx,ggml_repeat(ctx,tails,score),starts));
+-    return ggml_add(ctx,score,ggml_log(ctx,visible));
++    log_visible=ggml_log(ctx,visible);
++    return ggml_add(ctx,score,log_visible);
+ }
+ 
+ // top block_budget blocks by score, in ascending block order, expanded to their cells (-1 for an invisible block:
+@@ -1265,6 +1273,12 @@ public:
+     int64_t score_strip = 0;
+     std::vector<int64_t> score_key_limits;   // per strip, empty = no bound
+ 
++    // built once per graph and shared by the layers using this input set
++    std::map<std::array<int64_t, 3>, ggml_tensor *> visibility; // compact visibility term per strip
++    ggml_tensor * fast_members   = nullptr;                     // QSA cache update inputs (layer independent)
++    ggml_tensor * fast_positions = nullptr;
++    ggml_tensor * fast_rows      = nullptr;
++
+     const llama_memory_hybrid_idx_context * mctx;
+     const uint32_t ratio;
+ 
+@@ -1450,10 +1464,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     if (storage) {
+         auto cache_input = std::make_unique<llm_graph_input_qsa_cache>(mctx_hyb, il, cached != nullptr, fast_cache);
+         if (fast_cache) {
+-            member_rows = cache_input->members = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r*prep_blocks);
+-            block_positions = cache_input->positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*prep_blocks);
+-            cache_rows = cache_input->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, prep_blocks);
+-            ggml_set_input(member_rows); ggml_set_input(block_positions); ggml_set_input(cache_rows);
++            // the update rows do not depend on the layer: one input set for all layers
++            if (inp->fast_rows == nullptr) {
++                inp->fast_members   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r*prep_blocks);
++                inp->fast_positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*prep_blocks);
++                inp->fast_rows      = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, prep_blocks);
++                ggml_set_input(inp->fast_members); ggml_set_input(inp->fast_positions); ggml_set_input(inp->fast_rows);
++            }
++            member_rows = cache_input->members = inp->fast_members;
++            block_positions = cache_input->positions = inp->fast_positions;
++            cache_rows = cache_input->rows = inp->fast_rows;
+         }
+         res->add_input(std::move(cache_input));
+     }
+@@ -1555,7 +1575,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+ 
+         // one value per block, so it is cheaper to bias here than after the cells are expanded
+         if (inp->compact) {
+-            score = qwen4exp_apply_compact_visibility(ctx0, score, inp->bias, n_blocks, n_seq, n_tps, first, n_query);
++            score = qwen4exp_apply_compact_visibility(ctx0, score, inp->bias, n_blocks, n_seq, n_tps, first, n_query, inp->visibility);
+         } else if (blk_bias) {
+             score = ggml_add(ctx0, score, bias);
+         }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f4ac835..1f49282 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -14045,6 +14045,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mmv_group(2560, 10240, 6144));
+     test_cases.emplace_back(new test_mmv_group(2560, 1024, 6144));
+ 
++    // Q8_0 with 2..4 columns (speculative decoding batches): Qwen3.8-Flash-Next dense shapes, incl. few rows (split K)
++    for (int n : {2, 3, 4}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   640, n,  2560, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   100, n,   544, {2, 3}, {1, 2}));
++    }
++
+     // 256-expert MoE with 4/16/32/128 rows per expert, exercises the RDNA3.5 mul_mat_id tile selection
+     // Qwen3.8-Flash-Next (qwen4exp) UD-IQ4_XS experts: 512 experts, 10 active, gate/up IQ3_S [2560 -> 640], down IQ4_NL [640 -> 2560]
+     for (int n : {1, 8, 64, 512, 2048}) {

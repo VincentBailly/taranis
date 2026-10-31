@@ -1,0 +1,53 @@
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -95,13 +95,17 @@
+     }
+ }
+ 
+-template <typename DRowFn>
++// WAVE: stg is this wave's own staging area, so a wave-local barrier is enough
++__device__ __forceinline__ void mmb_wave_sync() {
++    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront"); __builtin_amdgcn_wave_barrier(); __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
++}
++template <bool WAVE = false, typename DRowFn>
+ __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restrict__ stg, float * __restrict__ D, uint16_t * __restrict__ Dh,
+         const bool store_f32, const int M, DRowFn drow, const int n_base, const int m_base, const int lane) {
+     const int cm = lane & 15, cn = lane >> 4;
+ #pragma unroll
+     for (int e = 0; e < 8; ++e) { stg[(2 * e + cn) * 16 + cm] = acc[e]; }
+-    __syncthreads();
++    if constexpr (WAVE) mmb_wave_sync(); else __syncthreads();
+     const int n = lane >> 1, half = lane & 1;
+     const int dr = drow(n_base + n);
+     if (dr >= 0) {
+@@ -121,7 +125,7 @@
+                    for (int k = 0; k < 8; ++k) { if (m_base + half * 8 + k < M) Dh[base + k] = mmb_f2bf(vv[k]); } }
+         }
+     }
+-    __syncthreads();
++    if constexpr (WAVE) mmb_wave_sync(); else __syncthreads();
+ }
+ template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, typename XRowFn, typename DRowFn>
+ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase, const size_t wrow_bytes, const int a_rows,
+@@ -239,8 +243,9 @@
+         const int ml = wm * WTM + i * 16; const bool ok = ml < a_rows;
+ #pragma unroll
+         for (int j = 0; j < TN; ++j) {
+-            if (ok && jact[j]) mmb_store_tile(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane);
+-            else { __syncthreads(); __syncthreads(); }
++            // routed tiles (TAIL): wave-local staging barriers, so waves with no valid fragment skip the epilogue
++            if (ok && jact[j]) mmb_store_tile<TAIL>(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane);
++            else if constexpr (!TAIL) { __syncthreads(); __syncthreads(); }
+         }
+     }
+ }
+@@ -601,7 +606,8 @@
+ }
+ 
+ template <int BM, int BN, int WTM, int WTN, int WTYPE = 0, bool Q4K_HALF = false, int NT = MMB_NT>
+-__global__ void __launch_bounds__(NT, 2)
++// small routed tiles: at least 10 waves per SIMD (the whole-block IQ3_S fetch otherwise drops them to 8)
++__global__ void __launch_bounds__(NT, (BN == 32 && BM == 64) ? 10 : 2)
+ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t expert_bytes, const uint16_t * __restrict__ Xh,
+         float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32,
+         const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,

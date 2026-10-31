@@ -1,0 +1,101 @@
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 1dc7ed3a..e3c28c07 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1434,11 +1434,13 @@ static __device__ __forceinline__ float gdn_decode_softplus(float x) {
+     return (x > 20.0f) ? x : logf(1.0f + expf(x));
+ }
+ 
++// 16 warps of S/16 state columns each, at most 96 VGPRs: two blocks fit a CU, so 48 value heads run at once on 40 CUs
++// (one 32-warp block per CU took two rounds). A column's arithmetic does not depend on the warp count.
+ template <int S, int D_CONV>
+-__global__ void __launch_bounds__(32 * 32, 1)
++__global__ void __launch_bounds__(32 * 16, 16)
+ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+     constexpr int warp_size     = 32;
+-    constexpr int nwarps        = 32;
++    constexpr int nwarps        = 16;
+     constexpr int rows_per_lane = S / warp_size;
+     constexpr int cols_per_warp = S / nwarps;
+     static_assert(S == warp_size * rows_per_lane && S == nwarps * cols_per_warp);
+@@ -1463,12 +1465,37 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+     const int i    = thread % S;
+     const int ch   = (part == 0 ? hk * S : part == 1 ? args.H_k * S + hk * S : 2 * args.H_k * S + h * S) + i;
+     float x[D_CONV];
++    // every token's inputs and the conv weights are loaded up front, so the token loop has no global loads to wait for
++    constexpr int max_tokens = 8;
++    float x_in[max_tokens];
++    float w[D_CONV];
+     if (thread < 3 * S) {
+ #pragma unroll
+         for (int j = 0; j < D_CONV - 1; j++) {
+             x[j] = args.conv_state_in[ch * (D_CONV - 1) + j];
+         }
++#pragma unroll
++        for (int j = 0; j < D_CONV; j++) {
++            w[j] = args.conv_w[ch * D_CONV + j];
++        }
++#pragma unroll
++        for (int t = 0; t < max_tokens; ++t) {
++            if (t < args.n_tokens) {
++                x_in[t] = args.qkv[t * args.qkv_token_stride + ch * args.qkv_stride];
++            }
++        }
+     }
++    float alpha_in[max_tokens];
++    float beta_in[max_tokens];
++#pragma unroll
++    for (int t = 0; t < max_tokens; ++t) {
++        if (t < args.n_tokens) {
++            alpha_in[t] = args.alpha[t * args.H_v + h];
++            beta_in[t]  = args.beta[t * args.H_v + h];
++        }
++    }
++    const float dt_bias = args.dt_bias[h];
++    const float ssm_a   = args.ssm_a[h];
+ 
+     float s_shard[cols_per_warp][rows_per_lane];
+     {
+@@ -1488,12 +1515,7 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+ 
+     // 1. causal conv + SiLU for this head's q, k and v channels; shift the conv state (CPY conv_state_last)
+     if (thread < 3 * S) {
+-        float w[D_CONV];
+-        x[D_CONV - 1] = args.qkv[t * args.qkv_token_stride + ch * args.qkv_stride];
+-#pragma unroll
+-        for (int j = 0; j < D_CONV; j++) {
+-            w[j] = args.conv_w[ch * D_CONV + j];
+-        }
++        x[D_CONV - 1] = x_in[0];
+ 
+         // ssm_conv_f32: fma chain from 0, then the (zero) bias add, then SiLU
+         float sumf = fmaf(x[0], w[0], 0.0f);
+@@ -1577,9 +1599,16 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+     }
+ 
+     // gate = softplus(alpha + dt_bias) * A, beta = sigmoid(beta): scalar per head, computed by every thread
+-    const float alpha_biased = args.alpha[t * args.H_v + h] + args.dt_bias[h];
+-    const float gate         = gdn_decode_softplus(alpha_biased) * args.ssm_a[h];
+-    const float beta_val     = gdn_decode_sigmoid(args.beta[t * args.H_v + h]);
++    const float alpha_biased = alpha_in[0] + dt_bias;
++    const float gate         = gdn_decode_softplus(alpha_biased) * ssm_a;
++    const float beta_val     = gdn_decode_sigmoid(beta_in[0]);
++    // the next token's inputs move to index 0 (static register indices, no scratch)
++#pragma unroll
++    for (int j = 0; j < max_tokens - 1; ++j) {
++        x_in[j]     = x_in[j + 1];
++        alpha_in[j] = alpha_in[j + 1];
++        beta_in[j]  = beta_in[j + 1];
++    }
+     const float g_val        = expf(gate);
+     __syncthreads();
+ 
+@@ -1692,7 +1721,7 @@ void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, cons
+     args.attn_out = attn_scratch;
+ 
+     const dim3 grid(args.H_v, 1, 1);
+-    const dim3 block(32, 32, 1);
++    const dim3 block(32, 16, 1);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, ctx.stream());
+     if (args.n_tokens == 1 && args.K == 1) {
+         ggml_cuda_kernel_launch(gdn_decode_fused_cuda<128, 4>, launch_params, args);

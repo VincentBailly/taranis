@@ -1,0 +1,110 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 3164cf38..b41275d8 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -165,6 +165,94 @@ struct common_sampler {
+         cur_p = { cur.data(), cur.size(), -1, false };
+     }
+ 
++    // the top k logits straight from the logits, without building the full candidate array, when the chain would
++    // start with top-k anyway: same candidates in the same order as top-k's partial sort, so it only applies when
++    // that order is unique (no NaN, no ties among the k+1 largest)
++    bool set_logits_top_k(struct llama_context * ctx, int idx) {
++        if (top_k_first < 0) {
++            top_k_first = 0;
++            const int n = llama_sampler_chain_n(chain);
++            for (int i = 0; i < n; ++i) {
++                const char * name = llama_sampler_name(llama_sampler_chain_get(chain, i));
++                if (name[0] == '?') {
++                    continue; // a disabled sampler, a no-op
++                }
++                if (strcmp(name, "top-k") == 0 && params.top_k > 0) {
++                    top_k_first = params.top_k;
++                }
++                break;
++            }
++        }
++        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++        const int k = top_k_first;
++        if (k <= 0 || k >= n_vocab || llama_get_sampled_logits_ith(ctx, idx) || llama_get_sampled_probs_ith(ctx, idx)) {
++            return false;
++        }
++        const auto rb = common_reasoning_budget_get_state(rbudget);
++        if (rb == REASONING_BUDGET_INTRO_FORCING || rb == REASONING_BUDGET_SOFT_FORCING || rb == REASONING_BUDGET_FORCING) {
++            return false; // the budget sampler masks the full array
++        }
++        const float * logits = llama_get_logits_ith(ctx, idx);
++        GGML_ASSERT(logits != nullptr);
++
++        // the k+1 largest, sorted descending; a value equal to the smallest kept one is taken too, so a tie at the
++        // boundary shows up as two equal neighbours
++        const int kk = k + 1;
++        cur.resize(kk);
++        int   n_top = 0;
++        float thr   = -INFINITY;
++        bool  nan   = false;
++        auto insert = [&](llama_token id, float v) {
++            if (v != v) {
++                nan = true;
++                return;
++            }
++            if (n_top == kk && v < thr) {
++                return;
++            }
++            int j = n_top < kk ? n_top++ : kk - 1;
++            while (j > 0 && cur[j - 1].logit < v) {
++                cur[j] = cur[j - 1];
++                --j;
++            }
++            cur[j] = { id, v, 0.0f };
++            if (n_top == kk) {
++                thr = cur[kk - 1].logit;
++            }
++        };
++        constexpr int B = 32;
++        int i = 0;
++        for (; i < kk && i < n_vocab; ++i) {
++            insert(i, logits[i]);
++        }
++        for (; i + B <= n_vocab; i += B) {
++            bool any = false;
++            for (int j = 0; j < B; ++j) {
++                any |= !(logits[i + j] < thr); // also true for NaN
++            }
++            if (any) {
++                for (int j = 0; j < B; ++j) {
++                    insert(i + j, logits[i + j]);
++                }
++            }
++        }
++        for (; i < n_vocab; ++i) {
++            insert(i, logits[i]);
++        }
++        if (nan) {
++            return false;
++        }
++        for (int j = 1; j < kk; ++j) {
++            if (cur[j].logit == cur[j - 1].logit) {
++                return false;
++            }
++        }
++        cur_p = { cur.data(), (size_t) k, -1, true };
++        return true;
++    }
++
++    int top_k_first = -1; // k when the chain's first active sampler is top-k, else 0; -1 before the first look
++
+     common_time_meas tm() {
+         return common_time_meas(t_total_us, params.no_perf);
+     }
+@@ -638,7 +726,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     auto & chain = gsmpl->chain;
+     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+ 
+-    gsmpl->set_logits(ctx, idx);
++    if (grammar_first || !gsmpl->set_logits_top_k(ctx, idx)) {
++        gsmpl->set_logits(ctx, idx);
++    }
+ 
+     // Check if a backend sampler has already sampled a token in which case we
+     // return that token id directly.

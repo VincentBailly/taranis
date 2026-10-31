@@ -1,0 +1,151 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index f06ac35..288ec01 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1824,6 +1824,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         return true;
+     }
+ 
++    // hint the target about the tokens it verifies next (the last of id_last + drafts), after a few of their predecessors
++    void ple_prefetch(const common_speculative_draft_params & dp, const llama_tokens * drafts) {
++        if (!params.ctx_tgt || !dp.prompt) {
++            return;
++        }
++        const size_t n_tail = std::min<size_t>(dp.prompt->size(), 8);
++        pf_tokens.assign(dp.prompt->end() - n_tail, dp.prompt->end());
++        pf_tokens.push_back(dp.id_last);
++        if (drafts) {
++            pf_tokens.insert(pf_tokens.end(), drafts->begin(), drafts->end());
++        }
++        llama_prefetch_tokens(params.ctx_tgt, pf_tokens.data(), (int32_t) pf_tokens.size(), 1);
++    }
++    llama_tokens pf_tokens;
++
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
+ 
+@@ -1858,6 +1873,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             }
+             pcum_acc[seq_id] = 1.0f;
+ 
++            // the target verifies id_last and the drafts next: let it start reading their per-token data
++            ple_prefetch(dp, nullptr);
++
+             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+ 
+@@ -1949,6 +1967,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 common_sampler_accept(smpl, id, true);
+ 
+                 result.push_back(id);
++                ple_prefetch(dp, &result);
+ 
+                 if (dp.result_q) {
+                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+diff --git a/include/llama.h b/include/llama.h
+index 79977bf..6e8920c 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1037,6 +1037,14 @@ extern "C" {
+             struct llama_context * ctx,
+               struct llama_batch   batch);
+ 
++    // Hint that a later decode will append the last n_new of these tokens, preceded by the others.
++    // Models that read per-token data from disk start reading it now. Optional, never changes results.
++    LLAMA_API void llama_prefetch_tokens(
++            struct llama_context * ctx,
++               const llama_token * tokens,
++                         int32_t   n_tokens,
++                         int32_t   n_new);
++
+     //
+     // Extended batch API
+     //
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5f55c7a..430a021 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4843,6 +4843,10 @@ int32_t llama_decode(
+     return ret;
+ }
+ 
++void llama_prefetch_tokens(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_new) {
++    ctx->get_model().prefetch_tokens(tokens, n_tokens, n_new);
++}
++
+ //
+ // perf
+ //
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 3fc1b0c..aa6c436 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -914,6 +914,8 @@ struct llama_model {
+     // prefetch_end runs on every exit of that decode. Nothing by default
+     virtual void prefetch_begin(std::unique_ptr<llama_model_prefetch> & /*state*/, const llama_batch & /*batch*/, uint32_t /*n_ubatch*/) const {}
+     virtual void prefetch_end(llama_model_prefetch * /*state*/) const {}
++    // see llama_prefetch_tokens
++    virtual void prefetch_tokens(const llama_token * /*tokens*/, int32_t /*n_tokens*/, int32_t /*n_new*/) const {}
+ 
+ protected:
+     llama_model_params params;
+diff --git a/src/models/models.h b/src/models/models.h
+index 70e2848..43f104c 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2581,6 +2581,7 @@ struct llama_model_qwen4exp : public llama_model_base {
+     // the PLE rows of the batch gathered one ubatch ahead on a worker thread (LLAMA_PLE_ASYNC=0: page-cache advice only)
+     void prefetch_begin(std::unique_ptr<llama_model_prefetch> & state, const llama_batch & batch, uint32_t n_ubatch) const override;
+     void prefetch_end(llama_model_prefetch * state) const override;
++    void prefetch_tokens(const llama_token * tokens, int32_t n_tokens, int32_t n_new) const override;
+ 
+     struct graph : public llm_build_delta_net_base {
+         graph(const llama_model & model, const llm_graph_params & params);
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 3c5f825..53468ec 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -2343,6 +2343,43 @@ void llama_model_qwen4exp::prefetch_end(llama_model_prefetch * state) const {
+     }
+ }
+ 
++// the rows of tokens that a later decode appends: page them in now (same hash as llm_graph_input_ple::set_input,
++// with the predecessors taken from the array; a token without enough of them in the array is skipped)
++void llama_model_qwen4exp::prefetch_tokens(const llama_token * tokens, int32_t n_tokens, int32_t n_new) const {
++    const auto & hp = hparams;
++    const int64_t n_gram = hp.ple_ngram_size, n_heads = hp.ple_n_heads, per_gram = hp.ple_heads_per_ngram;
++    const int64_t eos    = hp.ple_eos_token_id;
++    if (!ple_disk || n_heads <= 0 || n_gram < 2 || n_new <= 0 || n_new > n_tokens) {
++        return;
++    }
++    std::vector<int32_t> idx;
++    std::vector<int64_t> ctx(n_gram);
++    for (int64_t i = n_tokens - n_new; i < n_tokens; ++i) {
++        if (i < n_gram - 1) {
++            continue;
++        }
++        ctx[0] = tokens[i];
++        bool cut = false;
++        for (int64_t s = 1; s < n_gram; ++s) {
++            const llama_token t = cut ? LLAMA_TOKEN_NULL : tokens[i - s];
++            cut = cut || t < 0 || t == eos;
++            ctx[s] = cut ? eos : t;
++        }
++        for (int64_t n = 2; n <= n_gram; ++n) {
++            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
++            for (int64_t j = 1; j < n; ++j) {
++                mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
++            }
++            const int64_t base = (n - 2) * per_gram;
++            for (int64_t g = 0; g < per_gram; ++g) {
++                const int64_t h_i = base + g;
++                idx.push_back((int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]));
++            }
++        }
++    }
++    ple_disk->prefetch(idx.data(), idx.size());
++}
++
+ // Host-resident table (memory-mapped or loaded into RAM): dequantize rows idx[0..n_rows) into dst, laid out
+ // [dim, n_rows], exactly as the CPU get_rows would (same to_float).
+ //

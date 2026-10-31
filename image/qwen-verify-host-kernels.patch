@@ -1,0 +1,360 @@
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index c9e40bbb..2b66bf74 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1456,20 +1456,39 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+     const int thread = warp * warp_size + lane;
+     const int hk     = h % args.H_k;               // key/query head (fastmodulo(h_idx, neqk1) in gated_delta_net_cuda)
+ 
+-    // 1. causal conv + SiLU for this head's q, k and v channels; shift the conv state (CPY conv_state_last)
++    // several tokens run in sequence: the conv window and the state stay in registers between them, and the
++    // state after token t goes to rollback slot n_tokens - 1 - t (same values as one launch per token)
++    const int part = thread / S;                   // 0: q, 1: k, 2: v
++    const int i    = thread % S;
++    const int ch   = (part == 0 ? hk * S : part == 1 ? args.H_k * S + hk * S : 2 * args.H_k * S + h * S) + i;
++    float x[D_CONV];
+     if (thread < 3 * S) {
+-        const int part = thread / S;               // 0: q, 1: k, 2: v
+-        const int i    = thread % S;
+-        const int c    = part == 0 ? hk * S : part == 1 ? args.H_k * S + hk * S : 2 * args.H_k * S + h * S;
+-        const int ch   = c + i;
+-
+-        float x[D_CONV];
+-        float w[D_CONV];
+ #pragma unroll
+         for (int j = 0; j < D_CONV - 1; j++) {
+             x[j] = args.conv_state_in[ch * (D_CONV - 1) + j];
+         }
+-        x[D_CONV - 1] = args.qkv[ch * args.qkv_stride];
++    }
++
++    float s_shard[cols_per_warp][rows_per_lane];
++    {
++        const float * state_in = args.state_cache + (int64_t) args.state_ids[0] * args.state_row_stride + (int64_t) h * S * S;
++        const int     colw     = warp * cols_per_warp;
++#pragma unroll
++        for (int c = 0; c < cols_per_warp; c++) {
++#pragma unroll
++            for (int r = 0; r < rows_per_lane; r++) {
++                s_shard[c][r] = state_in[(colw + c) * S + r * warp_size + lane];
++            }
++        }
++    }
++
++    for (int t = 0; t < args.n_tokens; ++t) {
++    const int64_t slot = args.n_tokens - 1 - t;
++
++    // 1. causal conv + SiLU for this head's q, k and v channels; shift the conv state (CPY conv_state_last)
++    if (thread < 3 * S) {
++        float w[D_CONV];
++        x[D_CONV - 1] = args.qkv[t * args.qkv_token_stride + ch * args.qkv_stride];
+ #pragma unroll
+         for (int j = 0; j < D_CONV; j++) {
+             w[j] = args.conv_w[ch * D_CONV + j];
+@@ -1496,9 +1515,13 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+         if (part == 2 || h == hk) {
+ #pragma unroll
+             for (int j = 0; j < D_CONV - 1; j++) {
+-                args.conv_state_out[ch * (D_CONV - 1) + j] = x[j + 1];
++                args.conv_state_out[slot * args.conv_slot_stride + ch * (D_CONV - 1) + j] = x[j + 1];
+             }
+         }
++#pragma unroll
++        for (int j = 0; j < D_CONV - 1; j++) {
++            x[j] = x[j + 1];
++        }
+     }
+     __syncthreads();
+ 
+@@ -1553,16 +1576,15 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+     }
+ 
+     // gate = softplus(alpha + dt_bias) * A, beta = sigmoid(beta): scalar per head, computed by every thread
+-    const float alpha_biased = args.alpha[h] + args.dt_bias[h];
++    const float alpha_biased = args.alpha[t * args.H_v + h] + args.dt_bias[h];
+     const float gate         = gdn_decode_softplus(alpha_biased) * args.ssm_a[h];
+-    const float beta_val     = gdn_decode_sigmoid(args.beta[h]);
++    const float beta_val     = gdn_decode_sigmoid(args.beta[t * args.H_v + h]);
+     const float g_val        = expf(gate);
+     __syncthreads();
+ 
+     // 3. recurrence (gated_delta_net_cuda), cols_per_warp state columns per warp
+     {
+-        const float * state_in  = args.state_cache + (int64_t) args.state_ids[0] * args.state_row_stride + (int64_t) h * S * S;
+-        float *       state_out = args.state_out + (int64_t) h * S * S;
++        float *       state_out = args.state_out + slot * args.state_slot_stride + (int64_t) h * S * S;
+         const int     colw      = warp * cols_per_warp;
+ 
+         float k_reg[rows_per_lane];
+@@ -1573,15 +1595,6 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+             q_reg[r] = q_n[r * warp_size + lane];
+         }
+ 
+-        float s_shard[cols_per_warp][rows_per_lane];
+-#pragma unroll
+-        for (int c = 0; c < cols_per_warp; c++) {
+-#pragma unroll
+-            for (int r = 0; r < rows_per_lane; r++) {
+-                s_shard[c][r] = state_in[(colw + c) * S + r * warp_size + lane];
+-            }
+-        }
+-
+         // same explicit contractions as gated_delta_net_tiled_cuda (bit-identical to gated_delta_net_cuda)
+         float attn_col[cols_per_warp];
+ #pragma unroll
+@@ -1626,7 +1639,9 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+     // 4. pre-norm attention output to the scratch buffer (the gated rms norm runs as a second kernel: its
+     //    destination may alias inputs of this kernel that other blocks are still reading)
+     if (thread < S) {
+-        args.attn_out[(int64_t) h * S + thread] = attn[thread];
++        args.attn_out[t * S * args.H_v + (int64_t) h * S + thread] = attn[thread];
++    }
++    __syncthreads();
+     }
+ }
+ 
+@@ -1644,6 +1659,14 @@ gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, cons
+     const int warp = tid / warp_size;
+     const int lane = tid % warp_size;
+ 
++    // token blockIdx.y
++    const int64_t offset = (int64_t) blockIdx.y * gridDim.x * S;
++    attn += offset;
++    out  += offset;
++    if (z != nullptr) {
++        z += offset;
++    }
++
+     const float xi   = attn[(int64_t) h * S + tid];
+     const float part = gdn_warp_reduce_sum<warp_size>(fmaf(xi, xi, 0.0f));
+     if (lane == 0) {
+@@ -1681,22 +1704,7 @@ void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, cons
+         CUDA_CHECK(cudaMemcpyAsync(args.conv_state_out + slot * args.conv_slot_stride, args.conv_state_in,
+             conv_elems * sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
+     }
+-    for (int64_t t = 0; t < args.n_tokens; ++t) {
+-        const int64_t slot = args.n_tokens - 1 - t;
+-        ggml_cuda_gdn_decode_args step = args;
+-        step.qkv += t * args.qkv_token_stride;
+-        step.alpha += t * args.H_v;
+-        step.beta += t * args.H_v;
+-        step.conv_state_out += slot * args.conv_slot_stride;
+-        step.state_out += slot * args.state_slot_stride;
+-        step.attn_out += t * args.S * args.H_v;
+-        if (t > 0) {
+-            step.conv_state_in = args.conv_state_out + (slot + 1) * args.conv_slot_stride;
+-            step.state_cache = args.state_out + (slot + 1) * args.state_slot_stride;
+-            step.state_row_stride = 0;
+-        }
+-        ggml_cuda_kernel_launch(gdn_decode_fused_cuda<128, 4>, launch_params, step);
+-    }
++    ggml_cuda_kernel_launch(gdn_decode_fused_cuda<128, 4>, launch_params, args);
+ }
+ 
+ void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in) {
+@@ -1711,13 +1719,10 @@ void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const
+     args.attn_out = attn.get();
+     ggml_cuda_op_gdn_decode_fused_prenorm(ctx, args, attn.get());
+ 
+-    const dim3 grid(args.H_v, 1, 1);
++    // all tokens at once, after the recurrence has read all token inputs (the norm output can reuse their storage)
++    const dim3 grid(args.H_v, args.n_tokens, 1);
+     const dim3 norm_block(128, 1, 1);
+     const ggml_cuda_kernel_launch_params norm_params = ggml_cuda_kernel_launch_params(grid, norm_block, 0, ctx.stream());
+-    // Read all token inputs before the norm output can reuse their storage.
+-    for (int64_t t = 0; t < args.n_tokens; ++t) {
+-        const int64_t offset = t * args.S * args.H_v;
+-        ggml_cuda_kernel_launch(gdn_decode_norm_cuda<128>, norm_params, attn.get() + offset, args.norm_w,
+-            (z ? gated_out : args.out) + offset, args.eps_rms, z ? z + offset : nullptr);
+-    }
++    ggml_cuda_kernel_launch(gdn_decode_norm_cuda<128>, norm_params, attn.get(), args.norm_w,
++        z ? gated_out : args.out, args.eps_rms, z);
+ }
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index cbf018dc..ad2c4969 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -142,23 +142,29 @@ static __global__ void mul_mat_vec_f(
+         // compiler from pipelining the loop, and with one 8-byte load in flight per lane the single-column
+         // f32 matvecs (e.g. MoE routers) reach barely half the memory bandwidth. The accumulation order is
+         // unchanged, so the results are bit-identical.
+-        if constexpr (ncols_dst == 1 && !has_fusion) {
++        if constexpr (ncols_dst <= 4 && !has_fusion) {
+             constexpr int pf = 4;
+             for (; col2 + (pf - 1)*block_size < ncols2; col2 += pf*block_size) {
+                 float2 tmpx[pf];
+-                float2 tmpy[pf];
++                float2 tmpy[pf][ncols_dst];
+ #pragma unroll
+                 for (int i = 0; i < pf; ++i) {
+                     tmpx[i] = x2[col2 + i*block_size];
+                 }
+ #pragma unroll
+                 for (int i = 0; i < pf; ++i) {
+-                    tmpy[i] = y2[col2 + i*block_size];
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) {
++                        tmpy[i][j] = y2[j*stride_col_y2 + col2 + i*block_size];
++                    }
+                 }
+ #pragma unroll
+                 for (int i = 0; i < pf; ++i) {
+-                    ggml_cuda_mad(sumf[0], tmpx[i].x, tmpy[i].x);
+-                    ggml_cuda_mad(sumf[0], tmpx[i].y, tmpy[i].y);
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) {
++                        ggml_cuda_mad(sumf[j], tmpx[i].x, tmpy[i][j].x);
++                        ggml_cuda_mad(sumf[j], tmpx[i].y, tmpy[i][j].y);
++                    }
+                 }
+             }
+         }
+@@ -272,7 +278,38 @@ static __global__ void mul_mat_vec_f(
+                 gate_x2 = (const int *) gate_x;
+             }
+         }
+-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
++        int col2 = tid;
++        // same prefetching as the f32 path above (bit-identical; the small hyper-connection and gate
++        // projections of multi-token batches are latency bound with one load in flight per lane)
++        if constexpr (ncols_dst <= 4 && !has_fusion) {
++            constexpr int pf = 4;
++            for (; col2 + (pf - 1)*block_size < ncols2; col2 += pf*block_size) {
++                int    tmpx[pf];
++                float2 tmpy[pf][ncols_dst];
++#pragma unroll
++                for (int i = 0; i < pf; ++i) {
++                    tmpx[i] = x2[col2 + i*block_size];
++                }
++#pragma unroll
++                for (int i = 0; i < pf; ++i) {
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) {
++                        tmpy[i][j] = y2[j*stride_col_y2 + col2 + i*block_size];
++                    }
++                }
++#pragma unroll
++                for (int i = 0; i < pf; ++i) {
++                    const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx[i])[0]);
++                    const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx[i])[1]);
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) {
++                        ggml_cuda_mad(sumf[j], tmpx0, tmpy[i][j].x);
++                        ggml_cuda_mad(sumf[j], tmpx1, tmpy[i][j].y);
++                    }
++                }
++            }
++        }
++        for (; col2 < ncols2; col2 += block_size) {
+             const int tmpx = x2[col2];
+             int tmpx_gate = 0;
+             if constexpr (has_fusion) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 430a0210..55a2c030 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -860,6 +860,21 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+     return (int) users.size();
+ }
+ 
++void llama_context::sched_select(bool alt) {
++    if (alt == sched_is_alt) {
++        return;
++    }
++    if (alt && !sched_alt) {
++        sched_alt.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
++                gf_res_reserve->get_max_nodes(), false, cparams.op_offload));
++        ggml_backend_sched_set_copy_callback(sched_alt.get(), sched_copy_experts, this);
++        ggml_backend_sched_set_realloc_callback(sched_alt.get(), sched_graph_realloc, this);
++    }
++    std::swap(sched, sched_alt);
++    std::swap(gf_res_prev_active, gf_res_alt_active);
++    sched_is_alt = alt;
++}
++
+ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+     sched.reset(ggml_backend_sched_new(
+             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+@@ -888,6 +903,10 @@ void llama_context::sched_reserve() {
+ 
+     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
+ 
++    sched_select(false);
++    sched_alt.reset();
++    gf_res_alt_active = nullptr;
++
+     for (auto & res : gf_res_prev) {
+         res.reset();
+     }
+@@ -1135,6 +1154,7 @@ bool llama_context::memory_update(bool optimize) {
+             }
+         }
+         gf_res_prev_active = nullptr;
++        gf_res_alt_active  = nullptr;
+ 
+         if (!mctx->apply()) {
+             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+@@ -1678,6 +1698,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
++    sched_select(gtype == LLM_GRAPH_TYPE_DECODER_MTP && n_outputs > 0 && ubatch.n_tokens <= 8 && !cparams.pipeline_parallel);
++
+     auto * res = get_gf_res_prev();
+     auto * gf  = res->get_gf();
+ 
+@@ -1702,6 +1724,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         ggml_backend_sched_synchronize(sched.get());
+ 
+         gf_res_prev_active = nullptr;
++        if (gf_res_alt_active == res) {
++            gf_res_alt_active = nullptr;
++        }
+         res->reset();
+ 
+         ggml_backend_sched_reset(sched.get());
+@@ -2828,6 +2853,7 @@ ggml_cgraph * llama_context::graph_reserve(
+         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
+     }
+ 
++    sched_select(false);
+     ggml_backend_sched_reset(sched.get());
+ 
+     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
+@@ -2837,6 +2863,7 @@ ggml_cgraph * llama_context::graph_reserve(
+         }
+     }
+     gf_res_prev_active = nullptr;
++    gf_res_alt_active  = nullptr;
+ 
+     // store the n_outputs as it is, and restore it afterwards
+     // TODO: not sure if needed, might simplify in the future by removing this
+@@ -4080,7 +4107,9 @@ void llama_context::opt_epoch_iter(
+             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+ 
+             // the optimizer graph is allocated outside sched, so the next decode must rebuild
++            sched_select(false);
+             gf_res_prev_active = nullptr;
++            gf_res_alt_active  = nullptr;
+             res->reset();
+ 
+             auto * gf = model.build_graph(gparams);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index b9621c78..914d03cd 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -424,6 +424,14 @@ private:
+ 
+     llm_graph_result * gf_res_prev_active = nullptr;
+ 
++    // small MTP draft passes alternate with the catch-up pass over the target batch; a second scheduler keeps
++    // both graphs allocated so neither has to be rebuilt each step
++    ggml_backend_sched_ptr sched_alt;
++    llm_graph_result *     gf_res_alt_active = nullptr;
++    bool                   sched_is_alt      = false;
++
++    void sched_select(bool alt);
++
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 

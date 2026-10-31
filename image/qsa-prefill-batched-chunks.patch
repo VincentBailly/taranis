@@ -1,0 +1,432 @@
+diff --git a/ggml/src/ggml-cuda/qsa-prefill.cu b/ggml/src/ggml-cuda/qsa-prefill.cu
+index 2d7b32d3..311602b4 100644
+--- a/ggml/src/ggml-cuda/qsa-prefill.cu
++++ b/ggml/src/ggml-cuda/qsa-prefill.cu
+@@ -201,7 +201,14 @@ struct qsa3_layout {
+     float scale;
+ };
+ 
+-template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
++// One workgroup (8 waves) per group of 4 queries and kv head; the 48 query rows are 3 WMMA tiles. The union chunks (16 keys) are
++// processed 8 at a time with 3 barriers: (1) wave w computes the scores of chunk w for all rows over the full head dim (dim
++// pairs summed in order 0..7, the same sums as the per-wave partials of the previous kernel), (2) wave w applies the online
++// softmax of chunk w from the running max of the chunks before it (max is exact, so this matches the sequential update),
++// (3) wave w accumulates P.V for dims 32w..32w+31 over the 8 chunks in order. Bit-identical to the one-chunk-per-step kernel.
++#define QSA3_NC 8
++#define QSA3_QP 264
++template<bool DIRECT, bool MASK> __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void qsa3_attn_kernel(
+         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
+         const uint16_t * __restrict__ mask, const uint16_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
+         const int * __restrict__ ucount, float * __restrict__ out, const qsa3_layout s) {
+@@ -210,10 +217,11 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
+ #else
+     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, r = lane & 15, hi = lane >> 4;
+     const int g = blockIdx.x, kvh = blockIdx.y;
+-    __shared__ float4 part[3][8][64];
+-    __shared__ uint4  ptile[3][32];
+-    __shared__ float  alpha_s[48];
+-    __shared__ float  l_s[48];
++    __shared__ __attribute__((aligned(16))) uint16_t qs[48 * QSA3_QP];
++    __shared__ uint4 ptile[QSA3_NC][3][32];
++    __shared__ uint4 desc_s[QSA3_NC];
++    __shared__ float mloc_s[QSA3_NC][48], alpha_s[QSA3_NC][48], ls_s[QSA3_NC][48];
++    __shared__ float m_s[48], l_s[48];
+ 
+     const size_t nblk = (size_t) s.nk / 4;
+     const uint16_t * pkg = nullptr;
+@@ -231,31 +239,21 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
+     const uint16_t * gmsk = umask + (size_t) g * s.cap;
+     const int nchunks = ucount[g] >> 2;
+ 
+-    v16s qf[3][2];
+     {
+-        uint16_t * stage = reinterpret_cast<uint16_t *>(&part[0][0][0]) + w * (48 * 32);
+         const _Float16 hs = (_Float16) s.scale;
+-#pragma unroll
+-        for (int c = 0; c < 12; ++c) {
+-            const int row = 4*c + (lane >> 3), dq = 4 * (lane & 7);
++        for (int idx = tid; idx < 48 * 64; idx += 256) {
++            const int row = idx >> 6, dq = 4 * (idx & 63);
+             const int qi = row / 12, h = row - 12*qi;
+             const int query = QSA3_G * g + qi;
+             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+             if (query < s.n_q) {
+-                v = *reinterpret_cast<const float4 *>(reinterpret_cast<const char *>(q) + (size_t) query * s.q1 + (size_t) (kvh * s.gqa + h) * s.q2 + (size_t) (32*w + dq) * 4);
++                v = *reinterpret_cast<const float4 *>(reinterpret_cast<const char *>(q) + (size_t) query * s.q1 + (size_t) (kvh * s.gqa + h) * s.q2 + (size_t) dq * 4);
+             }
+             const uint16_t h0 = __builtin_bit_cast(uint16_t, (_Float16) v.x * hs), h1 = __builtin_bit_cast(uint16_t, (_Float16) v.y * hs);
+             const uint16_t h2 = __builtin_bit_cast(uint16_t, (_Float16) v.z * hs), h3 = __builtin_bit_cast(uint16_t, (_Float16) v.w * hs);
+-            *reinterpret_cast<uint2 *>(stage + row * 32 + dq) = make_uint2((uint32_t) h0 | ((uint32_t) h1 << 16), (uint32_t) h2 | ((uint32_t) h3 << 16));
++            *reinterpret_cast<uint2 *>(qs + row * QSA3_QP + dq) = make_uint2((uint32_t) h0 | ((uint32_t) h1 << 16), (uint32_t) h2 | ((uint32_t) h3 << 16));
+         }
+-        __syncthreads();
+-#pragma unroll
+-        for (int i = 0; i < 3; ++i)
+-#pragma unroll
+-            for (int t = 0; t < 2; ++t) {
+-                const uint16_t * src = stage + (16*i + r) * 32 + 16*t;
+-                qf[i][t] = __builtin_bit_cast(v16s, (uint4[2]){*reinterpret_cast<const uint4 *>(src), *reinterpret_cast<const uint4 *>(src + 8)});
+-            }
++        if (tid < 48) { m_s[tid] = -INFINITY; }
+         __syncthreads();
+     }
+     v8f O[3][2];
+@@ -265,50 +263,18 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
+         for (int t = 0; t < 2; ++t)
+ #pragma unroll
+             for (int e = 0; e < 8; ++e) { O[i][t][e] = 0.f; }
+-    float m = -INFINITY, l = 0.f;
+-    const int own_row = 16*w + r, own_qi = own_row / 12;
+-    const int own_query = QSA3_G * g + own_qi;
+-    const uint16_t * maskq = (mask && w < 3 && own_query < s.n_q)
+-        ? reinterpret_cast<const uint16_t *>(reinterpret_cast<const char *>(mask) + (size_t) own_query * s.m1) : nullptr;
++    float l = 0.f;
++    const uint16_t * maskq[3];
++#pragma unroll
++    for (int i = 0; i < 3; ++i) {
++        const int query = QSA3_G * g + (16*i + r) / 12;
++        maskq[i] = (mask && query < s.n_q) ? reinterpret_cast<const uint16_t *>(reinterpret_cast<const char *>(mask) + (size_t) query * s.m1) : nullptr;
++    }
+ 
+-    auto load_desc = [&](const int c, uint32_t & b01, uint32_t & b23, uint32_t & m01, uint32_t & m23) {
+-        const uint2 bb = *reinterpret_cast<const uint2 *>(gblk + 4*c);
+-        const uint2 mm = *reinterpret_cast<const uint2 *>(gmsk + 4*c);
+-        b01 = bb.x; b23 = bb.y; m01 = mm.x; m23 = mm.y;
+-    };
+     auto blk_of = [&](const uint32_t b01, const uint32_t b23, const int j) -> int {
+         const uint32_t v = (j < 2 ? b01 : b23) >> (16 * (j & 1)) & 0xFFFFu;
+         return v == 0xFFFFu ? 0 : (int) v;
+     };
+-    auto load_k = [&](const uint32_t b01, const uint32_t b23, const uint32_t m01, const uint32_t m23, v16s * kf) {
+-        const int j = r >> 2;
+-        const uint32_t mk = ((j < 2 ? m01 : m23) >> (16 * (j & 1))) & 0xffffu;
+-        if (((mk >> (r & 3)) & 0x1111u) == 0) {
+-            kf[0] = v16s{};
+-            kf[1] = v16s{};
+-            return;
+-        }
+-        const int kb = blk_of(b01, b23, j);
+-        if constexpr (DIRECT) {
+-            // the packed 16-half chunk at (key, w, t) is dims (2w+t)*16 .. +15 of that key's row
+-            const int key = 4*kb + (r & 3);
+-            const char * p = kbase + (size_t)key * s.knb1 + (size_t)((2*w) * 16) * 2;
+-#pragma unroll
+-            for (int t = 0; t < 2; ++t) {
+-                const char * q = p + (size_t)t * 32;
+-                kf[t] = __builtin_bit_cast(v16s, (uint4[2]){*reinterpret_cast<const uint4 *>(q), *reinterpret_cast<const uint4 *>(q + 16)});
+-            }
+-        } else {
+-            const uint16_t * krow = pkg + (size_t) kb * 1024 + (r & 3) * 16 + w * 128;
+-#pragma unroll
+-            for (int t = 0; t < 2; ++t) {
+-                const uint4 lo  = *reinterpret_cast<const uint4 *>(krow + t*64);
+-                const uint4 hi4 = *reinterpret_cast<const uint4 *>(krow + t*64 + 8);
+-                kf[t] = __builtin_bit_cast(v16s, (uint4[2]){lo, hi4});
+-            }
+-        }
+-    };
+-
+     auto mask_values = [&](uint2 v, uint32_t mk) {
+         uint32_t lo = 0, hi = 0;
+         if (mk & 0x1111u) lo |= 0x0000ffffu;
+@@ -317,142 +283,175 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
+         if (mk & 0x8888u) hi |= 0xffff0000u;
+         return make_uint2(v.x & lo, v.y & hi);
+     };
++    auto load_v = [&](const int cc, v16s * vf) {
++        const uint4 dd = desc_s[cc];
++        const int kb0 = blk_of(dd.x, dd.y, 0), kb1 = blk_of(dd.x, dd.y, 1), kb2 = blk_of(dd.x, dd.y, 2), kb3 = blk_of(dd.x, dd.y, 3);
++#pragma unroll
++        for (int t = 0; t < 2; ++t) {
++            const int d = 32*w + 16*t + r;
++            if constexpr (DIRECT) {
++                // the packed uint2 holds the four keys of block kb at dim d; gather them from the rows
++                const char * col = vbase + (size_t)d * 2;
++                auto kv4 = [&](const int kb) -> uint2 {
++                    const char * b = col + (size_t)(4*kb) * s.vnb1;
++                    const uint32_t a0 = *reinterpret_cast<const uint16_t *>(b);
++                    const uint32_t a1 = *reinterpret_cast<const uint16_t *>(b + s.vnb1);
++                    const uint32_t a2 = *reinterpret_cast<const uint16_t *>(b + 2*s.vnb1);
++                    const uint32_t a3 = *reinterpret_cast<const uint16_t *>(b + 3*s.vnb1);
++                    return make_uint2(a0 | (a1 << 16), a2 | (a3 << 16));
++                };
++                vf[t] = __builtin_bit_cast(v16s, (uint2[4]){
++                    mask_values(kv4(kb0), dd.z & 0xffffu), mask_values(kv4(kb1), dd.z >> 16),
++                    mask_values(kv4(kb2), dd.w & 0xffffu), mask_values(kv4(kb3), dd.w >> 16)});
++            } else {
++                const uint2 v0 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb0 * 1024 + d * 4), dd.z & 0xffffu);
++                const uint2 v1 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb1 * 1024 + d * 4), dd.z >> 16);
++                const uint2 v2 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb2 * 1024 + d * 4), dd.w & 0xffffu);
++                const uint2 v3 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb3 * 1024 + d * 4), dd.w >> 16);
++                vf[t] = __builtin_bit_cast(v16s, (uint2[4]){v0, v1, v2, v3});
++            }
++        }
++    };
+ 
+-    uint32_t b01 = 0, b23 = 0, m01 = 0, m23 = 0;
+-    v16s kf[2];
+-    if (nchunks > 0) { load_desc(0, b01, b23, m01, m23); load_k(b01, b23, m01, m23, kf); }
+-
+-    for (int c = 0; c < nchunks; ++c) {
+-        v8f sc[3];
+-#pragma unroll
+-        for (int i = 0; i < 3; ++i) {
++    for (int base = 0; base < nchunks; base += QSA3_NC) {
++        const int nc = min(QSA3_NC, nchunks - base);
++        v8f S[3];
++        if (w < nc) {
++            const int c = base + w;
++            const uint2 bb = *reinterpret_cast<const uint2 *>(gblk + 4*c);
++            const uint2 mm = *reinterpret_cast<const uint2 *>(gmsk + 4*c);
++            const uint32_t b01 = bb.x, b23 = bb.y, m01 = mm.x, m23 = mm.y;
++            if (lane == 0) { desc_s[w] = make_uint4(b01, b23, m01, m23); }
++            // keys no query of the group sees are not zeroed: every row's score for them becomes -inf below
++            const int kb = blk_of(b01, b23, r >> 2);
++            const uint16_t * krow0 = pkg + (size_t) kb * 1024 + (r & 3) * 16;
+ #pragma unroll
+-            for (int e = 0; e < 8; ++e) { sc[i][e] = 0.f; }
++            for (int i = 0; i < 3; ++i)
+ #pragma unroll
+-            for (int t = 0; t < 2; ++t) { sc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf[t], qf[i][t], sc[i]); }
+-        }
+-        v16s vf[2];
+-        {
+-            const int kb0 = blk_of(b01, b23, 0), kb1 = blk_of(b01, b23, 1), kb2 = blk_of(b01, b23, 2), kb3 = blk_of(b01, b23, 3);
+-#pragma unroll
+-            for (int t = 0; t < 2; ++t) {
+-                const int d = 32*w + 16*t + r;
+-                if constexpr (DIRECT) {
+-                    // the packed uint2 holds the four keys of block kb at dim d; gather them from the rows
+-                    const char * col = vbase + (size_t)d * 2;
+-                    auto kv4 = [&](const int kb) -> uint2 {
+-                        const char * b = col + (size_t)(4*kb) * s.vnb1;
+-                        const uint32_t a0 = *reinterpret_cast<const uint16_t *>(b);
+-                        const uint32_t a1 = *reinterpret_cast<const uint16_t *>(b + s.vnb1);
+-                        const uint32_t a2 = *reinterpret_cast<const uint16_t *>(b + 2*s.vnb1);
+-                        const uint32_t a3 = *reinterpret_cast<const uint16_t *>(b + 3*s.vnb1);
+-                        return make_uint2(a0 | (a1 << 16), a2 | (a3 << 16));
+-                    };
+-                    vf[t] = __builtin_bit_cast(v16s, (uint2[4]){
+-                        mask_values(kv4(kb0), m01 & 0xffffu), mask_values(kv4(kb1), m01 >> 16),
+-                        mask_values(kv4(kb2), m23 & 0xffffu), mask_values(kv4(kb3), m23 >> 16)});
+-                } else {
+-                    const uint2 v0 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb0 * 1024 + d * 4), m01 & 0xffffu);
+-                    const uint2 v1 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb1 * 1024 + d * 4), m01 >> 16);
+-                    const uint2 v2 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb2 * 1024 + d * 4), m23 & 0xffffu);
+-                    const uint2 v3 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb3 * 1024 + d * 4), m23 >> 16);
+-                    vf[t] = __builtin_bit_cast(v16s, (uint2[4]){v0, v1, v2, v3});
++                for (int e = 0; e < 8; ++e) { S[i][e] = 0.f; }
++#pragma unroll 2
++            for (int ws = 0; ws < 8; ++ws) {
++                v16s kf[2];
++#pragma unroll
++                for (int t = 0; t < 2; ++t) {
++                    if constexpr (DIRECT) {
++                        const char * p = kbase + (size_t)(4*kb + (r & 3)) * s.knb1 + (size_t)(ws * 64 + t * 32);
++                        kf[t] = __builtin_bit_cast(v16s, (uint4[2]){*reinterpret_cast<const uint4 *>(p), *reinterpret_cast<const uint4 *>(p + 16)});
++                    } else {
++                        const uint16_t * krow = krow0 + ws * 128 + t * 64;
++                        kf[t] = __builtin_bit_cast(v16s, (uint4[2]){*reinterpret_cast<const uint4 *>(krow), *reinterpret_cast<const uint4 *>(krow + 8)});
++                    }
+                 }
+-            }
+-        }
+-        uint32_t nb01 = 0, nb23 = 0, nm01 = 0, nm23 = 0;
+-        v16s kfn[2];
+-        if (c + 1 < nchunks) { load_desc(c + 1, nb01, nb23, nm01, nm23); load_k(nb01, nb23, nm01, nm23, kfn); }
+-        else { kfn[0] = kf[0]; kfn[1] = kf[1]; }
+-#pragma unroll
+-        for (int i = 0; i < 3; ++i) {
+-            if (i != w) {
+-                part[i][w][lane*2+0] = make_float4(sc[i][0], sc[i][1], sc[i][2], sc[i][3]);
+-                part[i][w][lane*2+1] = make_float4(sc[i][4], sc[i][5], sc[i][6], sc[i][7]);
+-            }
+-        }
+-        __syncthreads();
+-        if (w < 3) {
+-            float scf[8];
+ #pragma unroll
+-            for (int e = 0; e < 8; ++e) { scf[e] = 0.f; }
++                for (int i = 0; i < 3; ++i) {
++                    v8f p;
++#pragma unroll
++                    for (int e = 0; e < 8; ++e) { p[e] = 0.f; }
+ #pragma unroll
+-            for (int w2 = 0; w2 < 8; ++w2) {
+-                if (w2 == w) {
++                    for (int t = 0; t < 2; ++t) {
++                        const uint16_t * src = qs + (16*i + r) * QSA3_QP + 32*ws + 16*t;
++                        const v16s qf = __builtin_bit_cast(v16s, (uint4[2]){*reinterpret_cast<const uint4 *>(src), *reinterpret_cast<const uint4 *>(src + 8)});
++                        p = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf[t], qf, p);
++                    }
+ #pragma unroll
+-                    for (int e = 0; e < 8; ++e) { scf[e] += sc[w][e]; }
+-                } else {
+-                    const float4 a = part[w][w2][lane*2+0], b = part[w][w2][lane*2+1];
+-                    scf[0] += a.x; scf[1] += a.y; scf[2] += a.z; scf[3] += a.w; scf[4] += b.x; scf[5] += b.y; scf[6] += b.z; scf[7] += b.w;
++                    for (int e = 0; e < 8; ++e) { S[i][e] += p[e]; }
+                 }
+             }
+ #pragma unroll
+-            for (int e = 0; e < 8; ++e) {
+-                const int j = e >> 1, cc = 2*(e & 1) + hi;
+-                const uint32_t mk = ((j < 2 ? m01 : m23) >> (16 * (j & 1))) & 0xFFFFu;
+-                const bool kv = (mk >> (own_qi * 4 + cc)) & 1u;
+-                if (maskq && kv) { scf[e] += qsa3_h2f(maskq[4 * blk_of(b01, b23, j) + cc]); }
+-                if (!kv) { scf[e] = -INFINITY; }
+-            }
+-            float mloc = scf[0];
+-#pragma unroll
+-            for (int e = 1; e < 8; ++e) { mloc = fmaxf(mloc, scf[e]); }
+-            mloc = fmaxf(mloc, __shfl_xor(mloc, 16));
+-            const float mnew  = fmaxf(m, mloc);
+-            const float alpha = mnew == -INFINITY ? 1.f : exp2f((m - mnew) * QSA3_L2E);
+-            float p[8], ls = 0.f;
+-#pragma unroll
+-            for (int e = 0; e < 8; ++e) { p[e] = mnew == -INFINITY ? 0.f : exp2f((scf[e] - mnew) * QSA3_L2E); ls += p[e]; }
+-            ls += __shfl_xor(ls, 16);
+-            l = l * alpha + ls;
+-            m = mnew;
+-            uint32_t pp[4], po[4];
+-#pragma unroll
+-            for (int e2 = 0; e2 < 4; ++e2) {
+-                pp[e2] = (uint32_t) qsa3_f2h(p[2*e2]) | ((uint32_t) qsa3_f2h(p[2*e2+1]) << 16);
+-                po[e2] = (uint32_t) __shfl_xor((int) pp[e2], 16);
+-            }
+-            uint16_t ph[16];
++            for (int i = 0; i < 3; ++i) {
++                const int own_qi = (16*i + r) / 12;
++#pragma unroll
++                for (int e = 0; e < 8; ++e) {
++                    const int j = e >> 1, cc = 2*(e & 1) + hi;
++                    const uint32_t mk = ((j < 2 ? m01 : m23) >> (16 * (j & 1))) & 0xFFFFu;
++                    const bool kv = (mk >> (own_qi * 4 + cc)) & 1u;
++                    if constexpr (MASK) {
++                        if (maskq[i] && kv) { S[i][e] += qsa3_h2f(maskq[i][4 * blk_of(b01, b23, j) + cc]); }
++                    }
++                    S[i][e] = kv ? S[i][e] : -INFINITY;
++                }
++                float mloc = S[i][0];
+ #pragma unroll
+-            for (int e = 0; e < 8; ++e) {
+-                const uint16_t mine  = (e & 1) ? (uint16_t) (pp[e>>1] >> 16) : (uint16_t) (pp[e>>1] & 0xffffu);
+-                const uint16_t other = (e & 1) ? (uint16_t) (po[e>>1] >> 16) : (uint16_t) (po[e>>1] & 0xffffu);
+-                ph[2*e]   = hi ? other : mine;
+-                ph[2*e+1] = hi ? mine  : other;
++                for (int e = 1; e < 8; ++e) { mloc = fmaxf(mloc, S[i][e]); }
++                mloc = fmaxf(mloc, __shfl_xor(mloc, 16));
++                if (hi == 0) { mloc_s[w][16*i + r] = mloc; }
+             }
+-            if (hi == 0) {
+-                ptile[w][r*2+0] = make_uint4((uint32_t) ph[0] | ((uint32_t) ph[1] << 16), (uint32_t) ph[2] | ((uint32_t) ph[3] << 16),
+-                                             (uint32_t) ph[4] | ((uint32_t) ph[5] << 16), (uint32_t) ph[6] | ((uint32_t) ph[7] << 16));
+-                ptile[w][r*2+1] = make_uint4((uint32_t) ph[8] | ((uint32_t) ph[9] << 16), (uint32_t) ph[10] | ((uint32_t) ph[11] << 16),
+-                                             (uint32_t) ph[12] | ((uint32_t) ph[13] << 16), (uint32_t) ph[14] | ((uint32_t) ph[15] << 16));
+-                alpha_s[own_row] = alpha;
++        }
++        __syncthreads();
++        if (w < nc) {
++#pragma unroll
++            for (int i = 0; i < 3; ++i) {
++                const int row = 16*i + r;
++                float m = m_s[row];
++                for (int c2 = 0; c2 < w; ++c2) { m = fmaxf(m, mloc_s[c2][row]); }
++                const float mnew  = fmaxf(m, mloc_s[w][row]);
++                const bool none = mnew == -INFINITY;
++                const float ea = exp2f((m - mnew) * QSA3_L2E);
++                const float alpha = none ? 1.f : ea;
++                float p[8], ls = 0.f;
++#pragma unroll
++                for (int e = 0; e < 8; ++e) { const float ep = exp2f((S[i][e] - mnew) * QSA3_L2E); p[e] = none ? 0.f : ep; ls += p[e]; }
++                ls += __shfl_xor(ls, 16);
++                uint32_t pp[4], po[4];
++#pragma unroll
++                for (int e2 = 0; e2 < 4; ++e2) {
++                    pp[e2] = (uint32_t) qsa3_f2h(p[2*e2]) | ((uint32_t) qsa3_f2h(p[2*e2+1]) << 16);
++                    po[e2] = (uint32_t) __shfl_xor((int) pp[e2], 16);
++                }
++                uint16_t ph[16];
++#pragma unroll
++                for (int e = 0; e < 8; ++e) {
++                    const uint16_t mine  = (e & 1) ? (uint16_t) (pp[e>>1] >> 16) : (uint16_t) (pp[e>>1] & 0xffffu);
++                    const uint16_t other = (e & 1) ? (uint16_t) (po[e>>1] >> 16) : (uint16_t) (po[e>>1] & 0xffffu);
++                    ph[2*e]   = hi ? other : mine;
++                    ph[2*e+1] = hi ? mine  : other;
++                }
++                if (hi == 0) {
++                    ptile[w][i][r*2+0] = make_uint4((uint32_t) ph[0] | ((uint32_t) ph[1] << 16), (uint32_t) ph[2] | ((uint32_t) ph[3] << 16),
++                                                    (uint32_t) ph[4] | ((uint32_t) ph[5] << 16), (uint32_t) ph[6] | ((uint32_t) ph[7] << 16));
++                    ptile[w][i][r*2+1] = make_uint4((uint32_t) ph[8] | ((uint32_t) ph[9] << 16), (uint32_t) ph[10] | ((uint32_t) ph[11] << 16),
++                                                    (uint32_t) ph[12] | ((uint32_t) ph[13] << 16), (uint32_t) ph[14] | ((uint32_t) ph[15] << 16));
++                    alpha_s[w][row] = alpha;
++                    ls_s[w][row] = ls;
++                }
+             }
+         }
+         __syncthreads();
+-        float al[3];
++        if (w < 3) {
++            const int row = 16*w + r;
++            float m = m_s[row];
++            for (int cc = 0; cc < nc; ++cc) { l = l * alpha_s[cc][row] + ls_s[cc][row]; m = fmaxf(m, mloc_s[cc][row]); }
++            if (hi == 0) { m_s[row] = m; }
++        }
++        v16s vn[2];
++        load_v(0, vn);
++        for (int cc = 0; cc < nc; ++cc) {
++            v16s vf[2] = {vn[0], vn[1]};
++            if (cc + 1 < nc) { load_v(cc + 1, vn); }
++            float al[3];
+ #pragma unroll
+-        for (int i = 0; i < 3; ++i) { al[i] = alpha_s[16*i + r]; }
+-        if (__ballot(al[0] != 1.f || al[1] != 1.f || al[2] != 1.f)) {
++            for (int i = 0; i < 3; ++i) { al[i] = alpha_s[cc][16*i + r]; }
++            if (__ballot(al[0] != 1.f || al[1] != 1.f || al[2] != 1.f)) {
+ #pragma unroll
+-            for (int i = 0; i < 3; ++i)
++                for (int i = 0; i < 3; ++i)
+ #pragma unroll
+-                for (int t = 0; t < 2; ++t)
++                    for (int t = 0; t < 2; ++t)
+ #pragma unroll
+-                    for (int e = 0; e < 8; ++e) { O[i][t][e] *= al[i]; }
+-        }
++                        for (int e = 0; e < 8; ++e) { O[i][t][e] *= al[i]; }
++            }
+ #pragma unroll
+-        for (int i = 0; i < 3; ++i) {
+-            const v16s pf = __builtin_bit_cast(v16s, (uint4[2]){ptile[i][r*2+0], ptile[i][r*2+1]});
++            for (int i = 0; i < 3; ++i) {
++                const v16s pf = __builtin_bit_cast(v16s, (uint4[2]){ptile[cc][i][r*2+0], ptile[cc][i][r*2+1]});
+ #pragma unroll
+-            for (int t = 0; t < 2; ++t) { O[i][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf[t], pf, O[i][t]); }
++                for (int t = 0; t < 2; ++t) { O[i][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf[t], pf, O[i][t]); }
++            }
+         }
+-        kf[0] = kfn[0]; kf[1] = kfn[1];
+-        b01 = nb01; b23 = nb23; m01 = nm01; m23 = nm23;
++        __syncthreads();
+     }
+ 
+-    if (w < 3 && hi == 0) { l_s[own_row] = l; }
++    if (w < 3 && hi == 0) { l_s[16*w + r] = l; }
+     __syncthreads();
+-    float * ostage = reinterpret_cast<float *>(&part[0][0][0]) + w * (16 * 32);
++    float * ostage = reinterpret_cast<float *>(qs) + w * (16 * 32);
+ #pragma unroll
+     for (int i = 0; i < 3; ++i) {
+         const float li = l_s[16*i + r];
+@@ -556,11 +555,11 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
+                        k->nb[1], v->nb[1], k->nb[2], v->nb[2], nk, n_q, 12, cap, scale};
+     const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
+     if (qsa_direct) {
+-        ggml_cuda_kernel_launch(qsa3_attn_kernel<true>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
++        ggml_cuda_kernel_launch(m ? qsa3_attn_kernel<true, true> : qsa3_attn_kernel<true, false>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
+                                 m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
+                                 (const int *) ucount.get(), (float *) dst->data, layout);
+     } else {
+-        ggml_cuda_kernel_launch(qsa3_attn_kernel<false>, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
++        ggml_cuda_kernel_launch(m ? qsa3_attn_kernel<false, true> : qsa3_attn_kernel<false, false>, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
+                                 m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
+                                 (const int *) ucount.get(), (float *) dst->data, layout);
+     }

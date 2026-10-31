@@ -1,0 +1,119 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 61af1425..ba1ef5cf 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1041,6 +1041,15 @@ struct ggml_backend_sched {
+     int prev_graph_size;
+ 
+     int debug_realloc;
++
++    // small inputs from host memory are snapshotted into a pinned staging slot and copied asynchronously
++    struct ggml_backend_sched_stage {
++        ggml_backend_buffer_t buffer;
++        size_t                used;
++        ggml_backend_event_t  events [GGML_SCHED_MAX_BACKENDS];
++        bool                  pending[GGML_SCHED_MAX_BACKENDS];
++    } stage[4];
++    int stage_cur;
+ };
+ 
+ #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
+@@ -1990,12 +1999,52 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+         ggml_backend_buffer_is_host(t->buffer);
+ }
+ 
++// copy an input that lives in host memory through the current staging slot: the data is snapshotted, so the caller
++// may overwrite it right away, and the copy is queued on the split backend's stream behind its previous work
++static bool ggml_backend_sched_stage_input(ggml_backend_sched_t sched, int backend_id, struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
++    const size_t stage_size = 1024*1024;
++    ggml_backend_t backend = sched->backends[backend_id];
++    ggml_backend_buffer_t src_buf = input->view_src ? input->view_src->buffer : input->buffer;
++    if (sched->n_copies != 1 || backend->iface.set_tensor_async == NULL || src_buf == NULL || !ggml_backend_buffer_is_host(src_buf)) {
++        return false;
++    }
++    auto & st = sched->stage[sched->stage_cur];
++    if (st.buffer == NULL) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++        ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : NULL;
++        st.buffer = buft ? ggml_backend_buft_alloc_buffer(buft, stage_size) : NULL;
++        if (st.buffer == NULL) {
++            return false;
++        }
++    }
++    if (st.events[backend_id] == NULL) {
++        st.events[backend_id] = ggml_backend_event_new(ggml_backend_get_device(backend));
++        if (st.events[backend_id] == NULL) {
++            return false;
++        }
++    }
++    const size_t n = ggml_nbytes(input);
++    if (st.used + n > ggml_backend_buffer_get_size(st.buffer)) {
++        return false;
++    }
++    char * dst = (char *) ggml_backend_buffer_get_base(st.buffer) + st.used;
++    memcpy(dst, input->data, n);
++    ggml_backend_tensor_set_async(backend, input_cpy, dst, 0, n);
++    st.used += GGML_PAD(n, 64);
++    st.pending[backend_id] = true;
++    return true;
++}
++
+ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+     const int split_backend_id = split->backend_id;
+     ggml_backend_t split_backend = sched->backends[split_backend_id];
+     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+ 
++    if (ggml_backend_sched_stage_input(sched, split_backend_id, input, input_cpy)) {
++        return;
++    }
++
+     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+@@ -2043,6 +2092,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+ 
++    // reuse the oldest staging slot once its copies are done
++    sched->stage_cur = (sched->stage_cur + 1) % 4;
++    {
++        auto & st = sched->stage[sched->stage_cur];
++        for (int b = 0; b < sched->n_backends; b++) {
++            if (st.pending[b]) {
++                ggml_backend_event_synchronize(st.events[b]);
++                st.pending[b] = false;
++            }
++        }
++        st.used = 0;
++    }
++
+     int prev_backend_id = -1;
+ 
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+@@ -2074,6 +2136,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+             }
+         }
++        if (sched->stage[sched->stage_cur].pending[split_backend_id]) {
++            ggml_backend_event_record(sched->stage[sched->stage_cur].events[split_backend_id], split_backend);
++        }
+ 
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+@@ -2244,6 +2309,15 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+             ggml_backend_event_free(sched->events[b][c]);
+         }
+     }
++    for (auto & st : sched->stage) {
++        for (int b = 0; b < sched->n_backends; b++) {
++            if (st.pending[b]) {
++                ggml_backend_event_synchronize(st.events[b]);
++            }
++            ggml_backend_event_free(st.events[b]);
++        }
++        ggml_backend_buffer_free(st.buffer);
++    }
+     ggml_gallocr_free(sched->galloc);
+     ggml_free(sched->ctx);
+     ggml_hash_set_free(&sched->hash_set);

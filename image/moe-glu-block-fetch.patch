@@ -1,0 +1,132 @@
+diff --git a/ggml/src/ggml-cuda/mmb-quant.cuh b/ggml/src/ggml-cuda/mmb-quant.cuh
+--- a/ggml/src/ggml-cuda/mmb-quant.cuh
++++ b/ggml/src/ggml-cuda/mmb-quant.cuh
+@@ -78,6 +78,29 @@
+             mmb_h2f((uint16_t) w1) * (1 + 2 * (int)(w1 >> 16)), w0 >> 24);
+     }
+ };
++// IQ3_S: one lane's fields for a whole 256-weight block (4 k-steps) in one burst of loads, two fields per VGPR;
++// re-reading them every k-step thrashes L2 when many tiles are resident. mmb_iq3s_pack4<s> gives pack()'s (w0, w1).
++typedef unsigned short mmb_us2 __attribute__((ext_vector_type(2)));
++struct mmb_iq3s_raw4 { mmb_us2 qs[2], qh[2], sg[2], dsc, sc23; };
++__device__ __forceinline__ void mmb_iq3s_fetch4(const uint8_t * row, const int b, const int sub, const int il, mmb_iq3s_raw4 & r) {
++    const block_iq3_s * x = (const block_iq3_s *) row + b;
++#pragma unroll
++    for (int h = 0; h < 2; ++h) {
++        const int ib0 = 4 * h + sub, ib1 = 4 * h + 2 + sub;
++        r.qs[h].x = *(const uint16_t *)(x->qs + 8 * ib0 + 2 * il); r.qs[h].y = *(const uint16_t *)(x->qs + 8 * ib1 + 2 * il);
++        r.qh[h].x = x->qh[ib0]; r.qh[h].y = x->qh[ib1];
++        r.sg[h].x = x->signs[4 * ib0 + il]; r.sg[h].y = x->signs[4 * ib1 + il];
++    }
++    r.dsc.x = *(const uint16_t *) &x->d; r.dsc.y = *(const uint16_t *)(x->scales); r.sc23.x = *(const uint16_t *)(x->scales + 2);
++}
++template <int s>
++__device__ __forceinline__ void mmb_iq3s_pack4(const mmb_iq3s_raw4 & r, const int sub, uint32_t & w0, uint32_t & w1) {
++    const uint32_t qs = (s & 1) ? r.qs[s / 2].y : r.qs[s / 2].x, qh = (s & 1) ? r.qh[s / 2].y : r.qh[s / 2].x, sg = (s & 1) ? r.sg[s / 2].y : r.sg[s / 2].x;
++    const uint32_t sc = ((s < 2 ? r.dsc.y : r.sc23.x) >> 8 * (s & 1)) & 0xff;
++    w0 = qs | (qh << 16) | (sg << 24);
++    w1 = (uint32_t) r.dsc.x | (((sc >> 4 * sub) & 0xf) << 16);
++}
++
+ template <> struct mmb_lb<32 + GGML_TYPE_IQ2_XXS> {
+     static constexpr bool ok = true; using grid_t = uint64_t; static constexpr int N = 256;
+     static __device__ __forceinline__ grid_t entry(const int i) { return iq2xxs_grid[i]; }
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -421,10 +421,12 @@
+     typename LBT::raw lbg[LBR], lbu[LBR];
+     __shared__ typename LBT::grid_t lbgrid[LBT::N];
+     if constexpr (LB) { for (int i = tid; i < LBT::N; i += NT) lbgrid[i] = LBT::entry(i); }
++    constexpr bool B4 = WTYPE == 32 + GGML_TYPE_IQ3_S;   // whole-block fetch (K % 256 == 0 for IQ3_S)
++    mmb_iq3s_raw4 r4g[B4 ? LBR : 1], r4u[B4 ? LBR : 1];
+     int weight_ks = 0;
+     auto load_regs = [&](const int ks) {
+         weight_ks = ks;
+-        if constexpr (LB) {
++        if constexpr (LB && !B4) {
+             const int l8 = tid & 7, sub = l8 & 1, il = l8 >> 1;
+ #pragma unroll
+             for (int r = 0; r < LBR; ++r) {   // unconditional (padding rows read the last row; zeroed in store_lds)
+@@ -462,8 +464,34 @@
+             bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
+         }
+     };
++    auto fetch4 = [&](const int b) {
++        const int l8 = tid & 7, sub = l8 & 1, il = l8 >> 1;
++#pragma unroll
++        for (int r = 0; r < LBR; ++r) {
++            const int row = min((tid >> 3) + r * (NT / 8), a_rows - 1);
++            mmb_iq3s_fetch4(Wg + (size_t)row * wrow_bytes, b, sub, il, r4g[r]);
++            mmb_iq3s_fetch4(Wu + (size_t)row * wrow_bytes, b, sub, il, r4u[r]);
++        }
++    };
++    auto store4 = [&](auto qs) {   // k-step qs of the fetched block: same (w0, w1) as LBT::pack -> same decode
++        constexpr int s = decltype(qs)::value;
++        const int l8 = tid & 7, sub = l8 & 1, il = l8 >> 1;
++        if constexpr (B4) {
++#pragma unroll
++            for (int r = 0; r < LBR; ++r) {
++                const int row = (tid >> 3) + r * (NT / 8);
++                uint32_t g[2], u[2];
++                mmb_iq3s_pack4<s>(r4g[r], sub, g[0], g[1]);
++                mmb_iq3s_pack4<s>(r4u[r], sub, u[0], u[1]);
++                if (row >= a_rows) { g[0] = g[1] = u[0] = u[1] = 0u; }
++                *(uint4 *)(Ag + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = LBT::decode(lbgrid, g[0], g[1], il);
++                *(uint4 *)(Au + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = LBT::decode(lbgrid, u[0], u[1], il);
++            }
++        }
++    };
+     auto store_lds = [&]() {
+-        if constexpr (LB) {
++        if constexpr (B4) {   // weights come from store4
++        } else if constexpr (LB) {
+             // branchless (padding rows decode to zero); same fp32 arithmetic and the same RNE + sign-XOR packing
+             // as dequantize_*, so the BF16 weights are bit-identical to the generic decoder path
+             const int l8 = tid & 7, sub = l8 & 1, il = l8 >> 1;
+@@ -510,9 +538,7 @@
+ #pragma unroll
+     for (int j = 0; j < TN; ++j) jact[j] = !TAIL || (jcol0 + j * JSTEP) < n_cols;
+     const int nks = K / MMB_BK;
+-    load_regs(0); if constexpr (LB) __syncthreads(); store_lds(); __syncthreads();
+-    for (int ks = 0; ks < nks; ++ks) {
+-        if (ks + 1 < nks) load_regs(ks + 1);
++    auto mma = [&]() {
+ #pragma unroll
+         for (int kk = 0; kk < MMB_BK; kk += 16) {
+             v16s ag[TM], au[TM], b[TN]; const int r = lane & 15;
+@@ -532,9 +558,31 @@
+                     accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], au[i], accu[i][j]);
+                 }
+         }
+-        __syncthreads();
+-        if (ks + 1 < nks) store_lds();
+-        __syncthreads();
++    };
++    if constexpr (B4) {
++        load_regs(0); fetch4(0); __syncthreads(); store4(std::integral_constant<int, 0>{}); store_lds(); __syncthreads();
++        for (int ks4 = 0; ks4 < nks; ks4 += 4) {
++            auto step = [&](auto qs) {
++                constexpr int s = decltype(qs)::value;
++                const int ks = ks4 + s;
++                if (ks + 1 < nks) { load_regs(ks + 1); if constexpr (s == 3) fetch4((ks + 1) / 4); }
++                mma();
++                __syncthreads();
++                if (ks + 1 < nks) { store4(std::integral_constant<int, (s + 1) & 3>{}); store_lds(); }
++                __syncthreads();
++            };
++            step(std::integral_constant<int, 0>{}); step(std::integral_constant<int, 1>{});
++            step(std::integral_constant<int, 2>{}); step(std::integral_constant<int, 3>{});
++        }
++    } else {
++        load_regs(0); if constexpr (LB) __syncthreads(); store_lds(); __syncthreads();
++        for (int ks = 0; ks < nks; ++ks) {
++            if (ks + 1 < nks) load_regs(ks + 1);
++            mma();
++            __syncthreads();
++            if (ks + 1 < nks) store_lds();
++            __syncthreads();
++        }
+     }
+     float * stg = (float *)((BN * MMB_LDS_STRIDE * 2 >= NT / 32 * 1024) ? Bs : Ag) + wave * 256;
+ #pragma unroll

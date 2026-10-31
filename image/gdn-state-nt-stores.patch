@@ -1,0 +1,19 @@
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 5e0b3e0..90b8459 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1656,11 +1656,13 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
+             attn[colw + lane] = a * args.scale;
+         }
+ 
++        // non-temporal: written once per token (rollback slots) and read at the earliest by the next pass, so caching
++        // them only leaves dirty lines that the following kernels pay to write back
+ #pragma unroll
+         for (int c = 0; c < cols_per_warp; c++) {
+ #pragma unroll
+             for (int r = 0; r < rows_per_lane; r++) {
+-                state_out[(colw + c) * S + r * warp_size + lane] = s_shard[c][r];
++                __builtin_nontemporal_store(s_shard[c][r], &state_out[(colw + c) * S + r * warp_size + lane]);
+             }
+         }
+     }

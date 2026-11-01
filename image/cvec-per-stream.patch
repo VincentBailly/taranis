@@ -1,0 +1,57 @@
+diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
+index 6a7ffd6a..cc330d5c 100644
+--- a/src/llama-adapter.cpp
++++ b/src/llama-adapter.cpp
+@@ -62,7 +62,8 @@ bool llama_adapter_cvec::init(const llama_model & model) {
+         return it->second;
+     };
+ 
+-    // make tensors
++    // make tensors: [n_embd, hc] for a model with hc hyper-connection residual streams
++    const int64_t n_hc = hparams.dsv4_hc_mult > 1 ? hparams.dsv4_hc_mult : 1;
+     tensors.reserve(hparams.n_layer());
+     tensors.push_back(nullptr); // there's never a tensor for layer 0
+     for (size_t il = 1; il < hparams.n_layer(); il++) {
+@@ -72,7 +73,7 @@ bool llama_adapter_cvec::init(const llama_model & model) {
+             LLAMA_LOG_ERROR("%s: failed to allocate context for control vector\n", __func__);
+             return false;
+         }
+-        ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
++        ggml_tensor * tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.n_embd, n_hc);
+         tensors.push_back(tensor);
+     }
+ 
+@@ -109,7 +110,9 @@ bool llama_adapter_cvec::apply(
+         return true;
+     }
+ 
+-    if (n_embd != (int) hparams.n_embd) {
++    // one n_embd vector for every stream, or n_embd per stream
++    const int64_t n_hc = hparams.dsv4_hc_mult > 1 ? hparams.dsv4_hc_mult : 1;
++    if (n_embd != (int) hparams.n_embd && n_embd != (int) (hparams.n_embd * n_hc)) {
+         LLAMA_LOG_ERROR("%s: control vector n_embd does not match model\n", __func__);
+         return false;
+     }
+@@ -128,7 +131,9 @@ bool llama_adapter_cvec::apply(
+ 
+         const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
+         if (off + n_embd <= len) {
+-            ggml_backend_tensor_set(tensors[il], data + off, 0, n_embd * ggml_element_size(tensors[il]));
++            for (size_t o = 0; o < ggml_nbytes(tensors[il]); o += n_embd * ggml_element_size(tensors[il])) {
++                ggml_backend_tensor_set(tensors[il], data + off, o, n_embd * ggml_element_size(tensors[il]));
++            }
+         }
+     }
+ 
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index e4dc22c5..cc7b2a91 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -991,6 +991,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+         cb(cur, "ffn_out", il);
+ 
+         res_hc = build_hc_combine(res_hc, cur, inject, il);
++        res_hc = build_cvec(res_hc, il);
+ 
+         // "l_last" is the layer output name that build_cvec and imatrix look for
+         cb(res_hc, "l_last", il);

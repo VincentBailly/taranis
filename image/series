@@ -32,3 +32,4 @@ cuda-graph-capture-ahead.patch
 spec-rejection-eog-stop.patch
 qsa-decode-lane-fetch.patch
 spec-draft-q-like-target.patch
+cvec-per-stream.patch

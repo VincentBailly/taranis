@@ -1,0 +1,59 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index c9137664..471e34ad 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -3144,11 +3144,6 @@ static __global__ void mul_mat_vec_q_moe_shared_rdna3_5(
+     constexpr int warp_size = 32;
+ 
+     __shared__ uint32_t s_grid[type == GGML_TYPE_IQ3_S ? 512 : 1];
+-    if constexpr (type == GGML_TYPE_IQ3_S) {
+-        for (int i = threadIdx.y*warp_size + threadIdx.x; i < 512; i += c_nwarps*warp_size) {
+-            s_grid[i] = iq3s_grid[i];
+-        }
+-    }
+ 
+     const int lane = threadIdx.x;
+     const uint32_t slot  = blockIdx.y;
+@@ -3172,6 +3167,12 @@ static __global__ void mul_mat_vec_q_moe_shared_rdna3_5(
+             ++nm;
+         }
+     }
++    // fill the grid table only in blocks that compute (duplicate blocks have returned above)
++    if constexpr (type == GGML_TYPE_IQ3_S) {
++        for (int i = threadIdx.y*warp_size + threadIdx.x; i < 512; i += c_nwarps*warp_size) {
++            s_grid[i] = iq3s_grid[i];
++        }
++    }
+     __syncthreads();
+ 
+     const block_q8_1 * y[c_ncols];
+@@ -3215,8 +3216,10 @@ static bool mul_mat_vec_q_moe_shared_launch(
+                 ncols_x % ggml_cuda_type_traits<type>::qk != 0) {
+             return false;
+         }
+-        // fused gate/up: 2 warps x 2 rows; down: 2 warps x 8 rows (tuned on Qwen3.8-Flash-Next)
+-        const int nwarps = 2, rows_per_block = fusion.gate ? 2*2 : 2*8;
++        // fused gate/up: 2 warps x 2 rows (IQ3_S with 4 tokens: 8 warps x 2 rows); down: 2 warps x 8 rows
++        // (tuned on Qwen3.8-Flash-Next)
++        const bool wide = type == GGML_TYPE_IQ3_S && fusion.gate && ncols_dst == 4;
++        const int nwarps = wide ? 8 : 2, rows_per_block = fusion.gate ? nwarps*2 : 2*8;
+         const dim3 block_nums((nrows_x + rows_per_block - 1) / rows_per_block, nchannels_dst, ncols_dst);
+         const dim3 block_dims(32, nwarps, 1);
+         const auto launch = [&](auto kernel) {
+@@ -3228,7 +3231,15 @@ static bool mul_mat_vec_q_moe_shared_launch(
+             switch (ncols_dst) {
+                 case 2:  launch(mul_mat_vec_q_moe_shared_rdna3_5<type, true, 2, 2, 2>); break;
+                 case 3:  launch(mul_mat_vec_q_moe_shared_rdna3_5<type, true, 3, 2, 2>); break;
+-                default: launch(mul_mat_vec_q_moe_shared_rdna3_5<type, true, 4, 2, 2>); break;
++                default:
++                    if constexpr (type == GGML_TYPE_IQ3_S) {
++                        if (wide) {
++                            launch(mul_mat_vec_q_moe_shared_rdna3_5<type, true, 4, 8, 2>);
++                            break;
++                        }
++                    }
++                    launch(mul_mat_vec_q_moe_shared_rdna3_5<type, true, 4, 2, 2>);
++                    break;
+             }
+         } else {
+             switch (ncols_dst) {

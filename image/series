@@ -37,3 +37,4 @@ prompt-aux-gemms.patch
 qk-norm-rope.patch
 prompt-q8-decode.patch
 mtp-ehproj-shared-half.patch
+moe-glu-wide-blocks.patch

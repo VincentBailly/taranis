@@ -49,7 +49,7 @@ See [the test conditions and timing data](BENCHMARKS.md).
 
 ## An open stack behind the speed
 
-Taranis combines 34 model-kernel and scheduling patches with a tuned
+Taranis combines 40 model-kernel and scheduling patches with a tuned
 HIP/ROCr runtime. Optimization reaches from speculative verification to
 GPU command submission.
 

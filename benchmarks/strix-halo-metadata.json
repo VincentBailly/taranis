@@ -582,7 +582,7 @@
       "label": "taranis",
       "source_runtime": {
         "source_commit": "da731374077f2ad9bdffd4848f782b5694b9bb68",
-        "patch_count": 34,
+        "patch_count": 40,
         "rocm_systems_commit": "5bdc7e255d1a1a8b6319df3621380722485af8ec",
         "rocm_rpm": "10.0.0-4",
         "kv_precision": "f16",
@@ -597,7 +597,9 @@
           "DEBUG_HIP_GRAPH_PM4": "1"
         },
         "version": "0.6.0-dev (build 12166, commit da731374)",
-        "public_release_commit": "116dc0fb03063156cebdf0207129eb093d03faab"
+        "public_release_commit": "d5e78cfa0c334bc1000bd0066e4f4e14e4ffa7e4",
+        "image_id": "sha256:af651a282fa87bddabfd53ded493d0dc49673916bf1f450af41445ae4d218e77",
+        "image_config_digest": "sha256:daf0f64dc3a1e518b13c94dffb05f8547d3d8c0e6c226b433b837f6e20b3eee7"
       },
       "command_recipe": [
         "sudo",
@@ -636,7 +638,7 @@
         "HSA_OVERRIDE_GFX_VERSION=11.5.1",
         "-e",
         "DEBUG_HIP_GRAPH_PM4=1",
-        "sha256:244c50f71b6767c055b4c496565f119b24d87f464040d210d1c37d4ea0f25067",
+        "sha256:af651a282fa87bddabfd53ded493d0dc49673916bf1f450af41445ae4d218e77",
         "-m",
         "/models/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
         "--host",
@@ -901,22 +903,22 @@
       "label": "taranis",
       "backend": "HIP / ROCm",
       "measured_samples": 15,
-      "common_streamed_decode_tokens_per_second": 55.285778067067376,
-      "common_end_to_end_tokens_per_second": 39.31684437098781,
-      "native_prefill_tokens_per_second": 1207.6653062614469,
-      "native_decode_tokens_per_second": 55.49193010774062,
+      "common_streamed_decode_tokens_per_second": 55.42867217115505,
+      "common_end_to_end_tokens_per_second": 39.67217367252062,
+      "native_prefill_tokens_per_second": 1238.0275128548756,
+      "native_decode_tokens_per_second": 55.63541152796732,
       "long_reasoning_native_prompt_tokens": 8146,
-      "TTFT_8k_median_ms": 5873.525328999996,
+      "TTFT_8k_median_ms": 5715.796449000001,
       "TTFT_8k_samples_ms": [
-        5890.912032999993,
-        5873.525328999996,
-        5861.126475000012
+        5727.226868999998,
+        5715.796449000001,
+        5706.83303400001
       ],
-      "measured_suite_wall_ms": 97668.062161,
+      "measured_suite_wall_ms": 96793.28467599998,
       "native_prompt_tokens": 34257,
-      "native_prefill_ms": 28366.303,
+      "native_prefill_ms": 27670.629000000004,
       "native_decode_tokens": 3840,
-      "native_decode_ms": 69199.25099999999
+      "native_decode_ms": 69020.789
     },
     {
       "label": "strixllama",
@@ -975,5 +977,12 @@
     "normalizer": "unchanged frozen normalize.ts; complete matching reports"
   },
   "results": "strix-halo-results.json",
-  "results_sha256": "c77eb69cadb3a947c6d73126756abc2bc3f85405367524c0f8c066aaa0f53884"
+  "results_sha256": "4415e8d11ed30db217e5395f8f51062f158f8db4a208e656c4b7ac9d0035986e",
+  "taranis_refresh": {
+    "date": "2026-11-01",
+    "source_commit": "d5e78cfa0c334bc1000bd0066e4f4e14e4ffa7e4",
+    "warmup_requests": 5,
+    "measured_requests": 15,
+    "other_results_date": "2026-10-31"
+  }
 }

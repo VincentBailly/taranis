@@ -60,7 +60,7 @@
   "engines": {
     "taranis": {
       "llama_cpp": "da731374077f2ad9bdffd4848f782b5694b9bb68",
-      "patches": 34,
+      "patches": 40,
       "rocm_systems": "5bdc7e255d1a1a8b6319df3621380722485af8ec",
       "rocm_RPM": "10.0.0-4",
       "kv": "f16",
@@ -74,9 +74,9 @@
       "threads": 8,
       "threads_batch": 8,
       "hip_retained_pm4": true,
-      "public_release": "116dc0fb03063156cebdf0207129eb093d03faab",
+      "public_release": "d5e78cfa0c334bc1000bd0066e4f4e14e4ffa7e4",
       "build": "Packaged public ROCm image; image/Dockerfile flags; runtime and build/startup verified on GPU host",
-      "image_id": "sha256:244c50f71b6767c055b4c496565f119b24d87f464040d210d1c37d4ea0f25067",
+      "image_id": "sha256:af651a282fa87bddabfd53ded493d0dc49673916bf1f450af41445ae4d218e77",
       "server_flags": [
         "-m",
         "/models/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
@@ -133,7 +133,9 @@
         "HIP_PATH": "/opt/rocm/core-10.0",
         "HSA_OVERRIDE_GFX_VERSION": "11.5.1",
         "DEBUG_HIP_GRAPH_PM4": "1"
-      }
+      },
+      "image_config_digest": "sha256:daf0f64dc3a1e518b13c94dffb05f8547d3d8c0e6c226b433b837f6e20b3eee7",
+      "measured_date": "2026-11-01"
     },
     "halogen": {
       "version": "0.18.19",
@@ -359,7 +361,14 @@
         "taranis",
         "strixllama"
       ],
-      "measured_engines": 5
+      "measured_engines": 5,
+      "taranis_refresh": {
+        "date": "2026-11-01",
+        "source_commit": "d5e78cfa0c334bc1000bd0066e4f4e14e4ffa7e4",
+        "warmup_requests": 5,
+        "measured_requests": 15,
+        "other_results_date": "2026-10-31"
+      }
     },
     "strix_halo": {
       "hardware": {
@@ -388,9 +397,16 @@
         }
       },
       "date": "2026-10-31",
-      "status": "Earlier four-engine run; latest-version update pending"
+      "status": "Earlier four-engine run; latest-version update pending",
+      "taranis_refresh": {
+        "date": "2026-11-01",
+        "source_commit": "d5e78cfa0c334bc1000bd0066e4f4e14e4ffa7e4",
+        "warmup_requests": 5,
+        "measured_requests": 15,
+        "other_results_date": "2026-10-31"
+      }
     }
   },
   "scope": "Configured engine stacks using the same verified main GGUF inputs; native precision, runtime and MTP settings differ. Capped synthetic response speed; output quality has not been compared.",
-  "engine_settings_scope": "Top-level engine settings describe the earlier Strix Halo run. Gorgon Halo uses the engine versions and settings in gorgon-halo-metadata.json."
+  "engine_settings_scope": "Top-level Taranis settings describe the 2026-11-01 refresh on both platforms. Other top-level engine settings describe earlier runs; platform metadata records their measured versions and settings."
 }

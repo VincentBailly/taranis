@@ -5,15 +5,16 @@ Run from the Taranis repository root. Use absolute paths for `MODEL_DIR`
 `STRATA_DIR` (Strata source) and `PACK_DIR` (Strata assets). Verify the pinned
 model files against the hashes in metadata. Start one engine at a time.
 
-The completed **2026-10-31** five-engine runs use Halogen **0.18.21**, Strata
-app **0.2.9** / engine **0.1.55**, strix-llama.cpp **b1038 / Vulkan**,
-Taranis **34 patches** and stock llama.cpp **0ec4027** on both platforms.
+The **2026-10-31** comparison results use Halogen **0.18.21**, Strata
+app **0.2.9** / engine **0.1.55**, strix-llama.cpp **b1038 / Vulkan** and
+stock llama.cpp **0ec4027** on both platforms. Taranis results were refreshed
+on **2026-11-01** with **40 patches**.
 See [Strix Halo metadata](strix-halo-metadata.json) and
 [Gorgon Halo metadata](gorgon-halo-metadata.json) for pins and hashes.
 
 ## Taranis
 
-This packages llama.cpp `da731374077f2ad9bdffd4848f782b5694b9bb68` with 34
+This packages llama.cpp `da731374077f2ad9bdffd4848f782b5694b9bb68` with 40
 patches and the tuned ROCm `10.0.0-4` runtimes. The server flags match the
 measured configuration.
 

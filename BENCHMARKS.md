@@ -1,7 +1,7 @@
 # Benchmark results
 
-Both platforms ran five engines using the competitor releases checked on
-2026-10-31. Taranis used the same 34-patch packaged build in both runs.
+Other engine results use the competitor releases checked on 2026-10-31.
+Taranis was rerun on 2026-11-01 with the same 40-patch build on both GPUs.
 
 Each GPU ran one engine at a time, with CPU work and transfers idle during
 measurement. The Gorgon Halo Vulkan run followed a completed CPU build; its
@@ -30,11 +30,11 @@ loopback, using a fresh HTTP connection for each request.
 ## Gorgon Halo
 
 Ryzen AI Max+ PRO 495 / Radeon 8065S, 192 GiB installed RAM, Linux 6.18.57.
-Latest-version run: 75 measured requests across five engines.
+75 measured requests across five engines.
 
 | Engine | Decode (tok/s) | Prefill (tok/s) | 8K first token (s) | 15-request time (s) |
 |---|---:|---:|---:|---:|
-| Taranis | 62.7 | 1,453 | 4.85 | 84.6 |
+| Taranis | 63.4 | 1,511 | 4.67 | 83.1 |
 | Halogen 0.18.21 | 50.7 | 1,527 | 4.62 | 97.9 |
 | Strata 0.2.9 | 51.3 | 629 | 8.13 | 129.6 |
 | strix-llama.cpp b1038 (Vulkan) | 36.4 | 831 | 8.76 | 146.5 |
@@ -43,11 +43,11 @@ Latest-version run: 75 measured requests across five engines.
 ## Strix Halo
 
 Ryzen AI Max+ 395 / Radeon 8060S, 128 GiB installed RAM, Linux 7.0.0-38-generic.
-Latest-version run: 75 measured requests across five engines.
+75 measured requests across five engines.
 
 | Engine | Decode (tok/s) | Prefill (tok/s) | 8K first token (s) | 15-request time (s) |
 |---|---:|---:|---:|---:|
-| Taranis | 55.3 | 1,208 | 5.87 | 97.7 |
+| Taranis | 55.4 | 1,238 | 5.72 | 96.8 |
 | Halogen 0.18.21 | 45.7 | 1,278 | 5.54 | 110.6 |
 | Strata 0.2.9 | 33.8 | 504 | 10.20 | 182.0 |
 | strix-llama.cpp b1038 (Vulkan) | 33.9 | 698 | 10.64 | 162.0 |
@@ -74,7 +74,7 @@ are in [Strix metadata](benchmarks/strix-halo-metadata.json) and
 
 ## Engine settings
 
-- Taranis: 34 patches on `da731374077f2ad9bdffd4848f782b5694b9bb68`;
+- Taranis: 40 patches on `da731374077f2ad9bdffd4848f782b5694b9bb68`;
   retained-PM4 HIP/ROCr `5bdc7e255d1a1a8b6319df3621380722485af8ec`; ROCm RPM 10.0.0-4.
   F16 KV; batch/microbatch 8,192; 8 CPU threads; shared Q8_0 MTP, draft max 3,
   65,536-token draft vocabulary, probabilistic verification.

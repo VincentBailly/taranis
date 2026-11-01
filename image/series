@@ -35,3 +35,4 @@ spec-draft-q-like-target.patch
 cvec-per-stream.patch
 prompt-aux-gemms.patch
 qk-norm-rope.patch
+prompt-q8-decode.patch

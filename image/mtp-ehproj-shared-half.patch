@@ -1,0 +1,96 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 632711c..c913766 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -823,7 +823,9 @@ static __global__ void mul_mat_vec_q8_0_columns_rdna3_5(
+ 
+ // many channels (a batched 3D product, e.g. the MTP eh_proj over a prompt ubatch): each warp computes c_rows rows of
+ // c_cpw channels in turn, each output with exactly the arithmetic of the single-warp kernel above, reusing every
+-// activation load for c_rows rows; a block holds 8 such warps on neighbouring channels
++// activation load for c_rows rows; a block holds 8 such warps on neighbouring channels. The first shared_blocks blocks
++// of each column are the same in all columns (the eh_proj token embedding half, repeated over the hyper-connection
++// streams): their products are computed once and the partial sums copied to the other columns, the same sums.
+ template <int c_ncols, int c_cpw, int c_rows>
+ __launch_bounds__(8 * ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q8_0_columns_chan_rdna3_5(
+@@ -832,7 +834,7 @@ static __global__ void mul_mat_vec_q8_0_columns_chan_rdna3_5(
+         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+-        const uint32_t nchannels_dst) {
++        const uint32_t nchannels_dst, const int shared_blocks) {
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+     constexpr int blocks_per_iter = warp_size / 2;
+ 
+@@ -854,7 +856,30 @@ static __global__ void mul_mat_vec_q8_0_columns_chan_rdna3_5(
+         float * dst = dst_ptr + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+ 
+         float tmp[c_rows][c_ncols] = {{0.0f}};
+-        for (int kb = lane/2; kb < blocks_per_row_x; kb += blocks_per_iter) {
++        int kb = lane/2;
++        for (; kb < shared_blocks; kb += blocks_per_iter) {
++            const int4  yv = *(const int4 *) (y[kb].qs + 16*half);
++            const float dy = __low2float(y[kb].ds);
++#pragma unroll
++            for (int r = 0; r < c_rows; ++r) {
++                const block_q8_0 * xr = x + r*stride_row_x;
++                const int4  xv = *(const int4 *) (xr[kb].qs + 16*half);
++                const float dx = __half2float(xr[kb].d);
++                int sumi = ggml_cuda_dp4a(xv.x, yv.x, 0);
++                sumi = ggml_cuda_dp4a(xv.y, yv.y, sumi);
++                sumi = ggml_cuda_dp4a(xv.z, yv.z, sumi);
++                sumi = ggml_cuda_dp4a(xv.w, yv.w, sumi);
++                tmp[r][0] += dx * dy * (float) sumi;
++            }
++        }
++#pragma unroll
++        for (int r = 0; r < c_rows; ++r) {
++#pragma unroll
++            for (int j = 1; j < c_ncols; ++j) {
++                tmp[r][j] = tmp[r][0];
++            }
++        }
++        for (; kb < blocks_per_row_x; kb += blocks_per_iter) {
+             int4  yv[c_ncols];
+             float dy[c_ncols];
+ #pragma unroll
+@@ -916,7 +941,7 @@ static bool mul_mat_vec_q8_0_columns(
+         const int64_t stride_row_x, const int64_t stride_col_y, const int64_t stride_col_dst,
+         const int64_t nchannels_x, const int64_t nchannels_dst, const int64_t stride_channel_x, const int64_t stride_channel_y,
+         const int64_t stride_channel_dst, const int64_t nsamples_x, const int64_t nsamples_dst, const int64_t stride_sample_x,
+-        const int64_t stride_sample_y, const int64_t stride_sample_dst, cudaStream_t stream) {
++        const int64_t stride_sample_y, const int64_t stride_sample_dst, const int shared_blocks, cudaStream_t stream) {
+     const auto & info = ggml_cuda_info().devices[ggml_cuda_get_device()];
+     if (!GGML_CUDA_CC_IS_RDNA3_5(info.cc) || info.warp_size != 32 || ncols_dst < 2 || ncols_dst > 4) {
+         return false;
+@@ -928,13 +953,13 @@ static bool mul_mat_vec_q8_0_columns(
+     const uint3 channel_ratio = init_fastdiv_values(nchannels_dst / nchannels_x);
+     const uint3 sample_ratio  = init_fastdiv_values(nsamples_dst / nsamples_x);
+     if (!split_k && vgate == nullptr && nchannels_dst >= 64 && nrows_x % 8 == 0) {
+-        constexpr int cpw = 4;
++        constexpr int cpw = 1;
+         const dim3 cb_nums(nrows_x / 8, (nchannels_dst + 8*cpw - 1) / (8*cpw), nsamples_dst);
+         const dim3 cb_dims(32, 8, 1);
+         const auto launch_c = [&](auto kernel) {
+             kernel<<<cb_nums, cb_dims, 0, stream>>>(vx, vy, dst, ncols_x, stride_row_x, stride_col_y, stride_col_dst,
+                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, (uint32_t) nchannels_dst);
++                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, (uint32_t) nchannels_dst, shared_blocks);
+         };
+         switch (ncols_dst) {
+             case 2:  launch_c(mul_mat_vec_q8_0_columns_chan_rdna3_5<2, cpw, 8>); break;
+@@ -4192,9 +4217,13 @@ void ggml_cuda_mul_mat_vec_q(
+     const bool glu_columns = !ids && ncols_dst > 1 && fusion_local.gate != nullptr && fusion_local.glu_op == GGML_GLU_OP_SWIGLU &&
+         fusion_local.x_bias == nullptr && fusion_local.gate_bias == nullptr && fusion_local.x_scale == nullptr &&
+         fusion_local.gate_scale == nullptr && fusion_local.shared_up == nullptr;
++    // src1 = concat(repeat(a with ne[1] = 1), b) along ne[0]: the blocks of a are the same in all columns
++    const ggml_tensor * rep = src1->op == GGML_OP_CONCAT && ggml_get_op_params_i32(src1, 0) == 0 ? src1->src[0] : nullptr;
++    const int shared_blocks = rep && rep->op == GGML_OP_REPEAT && rep->src[0]->ne[1] == 1 && rep->ne[0] % QK8_1 == 0 ?
++        rep->ne[0] / QK8_1 : 0;
+     if (src0->type == GGML_TYPE_Q8_0 && ids == nullptr && (no_fusion || glu_columns) && !exact_batch &&
+             mul_mat_vec_q8_0_columns(src0->data, glu_columns ? fusion_local.gate : nullptr, src1_q8, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+-                ne02, nchannels_dst, s02, stride_channel_y, stride_channel_dst, ne03, ne3, s03, s13, s3, stream)) {
++                ne02, nchannels_dst, s02, stride_channel_y, stride_channel_dst, ne03, ne3, s03, s13, s3, shared_blocks, stream)) {
+         return;
+     }
+     if (ids == nullptr && no_fusion && !exact_batch &&

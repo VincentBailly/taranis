@@ -1,0 +1,161 @@
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index b64ea51..6ce62ee 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -332,7 +332,8 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
+     const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
+     constexpr int B_ITEMS = (BN * 8) / MMB_NT;
+     uint4 a0 = make_uint4(0,0,0,0), a1 = make_uint4(0,0,0,0); uint32_t a2 = 0; uint4 bst[B_ITEMS]; int brow[B_ITEMS];
+-    uint4 aw[WTYPE == 2 ? 8 : 1];
++    typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));   // a uint4 struct copy lowers to memcpy and kept aw[] in scratch
++    u32x4 aw[WTYPE == 2 ? 8 : 1];
+     const uint8_t * arow = W;
+     if (tid < BM) { const int c = tid / CH, i = tid - c * CH; arow = W + (size_t)(c * E + e0 + i) * wrow_bytes; }
+ #pragma unroll
+@@ -341,7 +342,7 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
+     auto load_regs = [&](const int ks) {
+         weight_ks = ks;
+         if constexpr (WTYPE == 0) if (tid < BM) { const uint8_t * p = arow + (size_t)ks * 36; a0 = *(const uint4 *)(p); a1 = *(const uint4 *)(p + 16); a2 = *(const uint32_t *)(p + 32); }
+-        if constexpr (WTYPE == 2) if (tid < BM) { const uint4 * p = (const uint4 *)(arow + (size_t)ks * MMB_BK * 2);
++        if constexpr (WTYPE == 2) if (tid < BM) { const u32x4 * p = (const u32x4 *)(arow + (size_t)ks * MMB_BK * 2);
+ #pragma unroll
+             for (int q = 0; q < 8; ++q) aw[q] = p[q]; }
+ #pragma unroll
+@@ -352,7 +353,7 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
+         if constexpr (WTYPE == 0) { if (tid < BM) mmb_dq_row36(a0, a1, a2, (uint32_t *)(As + tid * MMB_LDS_STRIDE)); }
+         else if constexpr (WTYPE == 2) { if (tid < BM) {
+ #pragma unroll
+-            for (int q = 0; q < 8; ++q) *(uint4 *)(As + tid * MMB_LDS_STRIDE + q * 8) = aw[q]; } }
++            for (int q = 0; q < 8; ++q) *(u32x4 *)(As + tid * MMB_LDS_STRIDE + q * 8) = aw[q]; } }
+         else {
+             constexpr int TYPE = WTYPE == 1 ? GGML_TYPE_Q8_0 : WTYPE - 32;
+             for (int row = tid / 8; row < BM; row += MMB_NT / 8) {
+@@ -394,23 +395,34 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
+     }
+     // epilogue: lane holds channel (lane & 15) of the wave's 16 and tokens 2e + (lane >> 4) of each 16-token fragment
+     const int cm = lane & 15, cn = lane >> 4; const int ch = e0 + wm * 16 + cm;
++    // all Xn loads first (rows clamped to T-1, unused for t >= T): one memory round trip instead of 16
++    uint16_t xv[2][8][HC];
++#pragma unroll
++    for (int j = 0; j < 2; ++j)
++#pragma unroll
++        for (int e = 0; e < 8; ++e) {
++            const int t = min(t0 + wn * 32 + j * 16 + 2 * e + cn, T - 1);
++            const uint16_t * xr = Xn + (uint32_t) (t * (HC * E) + ch);
++#pragma unroll
++            for (int c = 0; c < HC; ++c) xv[j][e][c] = xr[(uint32_t) (c * E)];
++        }
+ #pragma unroll
+     for (int j = 0; j < 2; ++j) {
+ #pragma unroll
+         for (int e = 0; e < 8; ++e) {
+             const int t = t0 + wn * 32 + j * 16 + 2 * e + cn;
+-            if (t >= T) continue;
+-            const uint16_t * xr = Xn + (size_t)t * ((size_t)HC * E) + ch;
+             float s = 0.f;
+ #pragma unroll
+             for (int c = 0; c < HC; ++c) {
+                 const float g = __uint_as_float(((uint32_t) mmb_f2bf(acc[c][j][e])) << 16);   // the gate GEMM's BF16 epilogue rounding
+-                const float term = gm_mul_rn(gm_bf2f(xr[(size_t)c * E]), gm_sigmoid(g));
++                const float term = gm_mul_rn(gm_bf2f(xv[j][e][c]), gm_sigmoid(g));
+                 s = (c == 0) ? term : gm_add_rn(s, term);
+             }
+             const float o = scale * s + bias;
+-            if (store_f32) Out[(size_t)t * E + ch] = o;
+-            if (OutH) OutH[(size_t)t * E + ch] = mmb_f2bf(o);
++            if (t < T) {
++                if (store_f32) Out[(size_t)t * E + ch] = o;
++                if (OutH) OutH[(size_t)t * E + ch] = mmb_f2bf(o);
++            }
+         }
+     }
+ #endif
+@@ -716,7 +728,8 @@ __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo
+ // EPI == 1 (qwen4exp QSA indexer scorer): the T columns are (query, head) pairs with 4 heads, and D is [M, T/4] with
+ // D[q*M + m] = ((relu(h0) + relu(h1)) + relu(h2)) + relu(h3) (+ log(step(float(tails[q]) - float(starts[m]))) when
+ // tails != nullptr): the exact expression the separate GEMM, idx_relu_sum and visibility chain evaluate.
+-template <int BM, int BN, int WTM, int WTN, bool TWO, bool XSPLIT, int EPI = 0>
++// BKs: K columns per LDS stage (K % BKs == 0). 128 waits on 4x fewer barriers and load round trips than 32 for long K.
++template <int BM, int BN, int WTM, int WTN, bool TWO, bool XSPLIT, int EPI = 0, int BKs = 32>
+ __global__ void __launch_bounds__(MMB_NT, 2)
+ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, float * __restrict__ D, const int M, const int K, const int T,
+         const float * __restrict__ W2 = nullptr, float * __restrict__ D2 = nullptr, const int M1 = 0,
+@@ -726,7 +739,7 @@ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X,
+     // WMMA (wave32, 16x16x16 bf16/f16 into f32) exists only on RDNA3; the host gate keeps other devices off this path
+     NO_DEVICE_CODE;
+ #else
+-    constexpr int BKs = 32, LS = BKs + 8, WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
++    constexpr int LS = BKs + 8, WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
+     static_assert(WAVES_M * (BN / WTN) * 32 == MMB_NT, "tile must use every wave");
+     __shared__ __align__(16) uint16_t Ah[BM * LS], Al[TWO ? 8 : BM * LS], Bh[BN * LS], Bl[XSPLIT ? BN * LS : 8];
+     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, wm = wave % WAVES_M, wn = wave / WAVES_M;
+@@ -746,23 +759,23 @@ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X,
+     float4 ra[A_IT], rb[B_IT];
+     auto gload = [&](const int k0) {
+ #pragma unroll
+-        for (int i = 0; i < A_IT; ++i) { const int idx = tid + i * MMB_NT, row = idx >> 3, c4 = (idx & 7) * 4;
++        for (int i = 0; i < A_IT; ++i) { const int idx = tid + i * MMB_NT, row = idx / (BKs / 4), c4 = idx % (BKs / 4) * 4;
+             const int gr = min(m0 + row, M - 1);
+             const float * wr = (W2 && gr >= M1) ? W2 + (size_t) (gr - M1) * K : W + (size_t) gr * K;
+             ra[i] = *(const float4 *)(wr + k0 + c4); }
+ #pragma unroll
+-        for (int i = 0; i < B_IT; ++i) { const int idx = tid + i * MMB_NT, row = idx >> 3, c4 = (idx & 7) * 4;
++        for (int i = 0; i < B_IT; ++i) { const int idx = tid + i * MMB_NT, row = idx / (BKs / 4), c4 = idx % (BKs / 4) * 4;
+             rb[i] = *(const float4 *)(X + (size_t) min(t0 + row, T - 1) * K + k0 + c4); }
+     };
+     auto lstore = [&]() {
+ #pragma unroll
+-        for (int i = 0; i < A_IT; ++i) { const int idx = tid + i * MMB_NT, row = idx >> 3, c4 = (idx & 7) * 4;
++        for (int i = 0; i < A_IT; ++i) { const int idx = tid + i * MMB_NT, row = idx / (BKs / 4), c4 = idx % (BKs / 4) * 4;
+             const float4 v = m0 + row < M ? ra[i] : make_float4(0.f,0.f,0.f,0.f);
+             uint16_t h[4], l[4]; mmb_split2(v.x,h[0],l[0]); mmb_split2(v.y,h[1],l[1]); mmb_split2(v.z,h[2],l[2]); mmb_split2(v.w,h[3],l[3]);
+             *(uint2 *)(Ah + row * LS + c4) = make_uint2((uint32_t)h[0] | ((uint32_t)h[1] << 16), (uint32_t)h[2] | ((uint32_t)h[3] << 16));
+             if constexpr (!TWO) *(uint2 *)(Al + row * LS + c4) = make_uint2((uint32_t)l[0] | ((uint32_t)l[1] << 16), (uint32_t)l[2] | ((uint32_t)l[3] << 16)); }
+ #pragma unroll
+-        for (int i = 0; i < B_IT; ++i) { const int idx = tid + i * MMB_NT, row = idx >> 3, c4 = (idx & 7) * 4;
++        for (int i = 0; i < B_IT; ++i) { const int idx = tid + i * MMB_NT, row = idx / (BKs / 4), c4 = idx % (BKs / 4) * 4;
+             const float4 v = t0 + row < T ? rb[i] : make_float4(0.f,0.f,0.f,0.f);
+             uint16_t h[4], l[4]; mmb_split2(v.x,h[0],l[0]); mmb_split2(v.y,h[1],l[1]); mmb_split2(v.z,h[2],l[2]); mmb_split2(v.w,h[3],l[3]);
+             *(uint2 *)(Bh + row * LS + c4) = make_uint2((uint32_t)h[0] | ((uint32_t)h[1] << 16), (uint32_t)h[2] | ((uint32_t)h[3] << 16));
+@@ -1327,9 +1340,9 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+         const float * W = (const float *) src0->data, * X = (const float *) src1->data; float * D = (float *) dst->data;
+         // MMB_F32_TILE narrows the M>64 F32 GEMM (e.g. the M=512 MoE router) for more blocks per ubatch chunk.
+         // 0 keeps master's 128x128 tile. Valid geometries satisfy (8/WAVES_M)*WTN == BN (the kernel's static_assert).
+-        // Default: 5 (32x64) for M <= 1024 (the M=512 router: 87 -> 77 ms per pp4096 on gfx1151, about -0.4% GPU time),
+-        // 128x128 above, where the narrow tile would reload the activations ~3x more per output. Every geometry keeps the
+-        // per-output K order, so the output is the same.
++        // Default: 5 for M <= 1024: 128x64 with 128-column K slices when K % 128 == 0 (the M=512 router: 2.19 -> 1.4 ms per
++        // 8192-token batch on gfx1151), else 32x64; 128x128 above, where the narrow tile would reload the activations ~3x
++        // more per output. Every geometry keeps the per-output K order, so the output is the same.
+         static const int FT_env = getenv("MMB_F32_TILE") ? atoi(getenv("MMB_F32_TILE")) : -1;
+         const int FT = FT_env >= 0 ? FT_env : (M <= 1024 ? 5 : 0);
+         // MMB_F32_SMALL: M <= 64 (ssm_alpha / ssm_beta [2560 -> 48]) launches only T/128 blocks at 64x128 (32 at 4096 tokens
+@@ -1337,7 +1350,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+         static const int FS = getenv("MMB_F32_SMALL") ? atoi(getenv("MMB_F32_SMALL")) : 2;
+         if (M <= 64 && FS == 2) {
+             dim3 grid((M + 63) / 64, (T + 31) / 32);
+-            mmb_f32split_kernel<64, 32, 16, 16, true, false><<<grid, MMB_NT, 0, stream>>>(W, X, D, M, K, T);
++            if (K % 128 == 0) mmb_f32split_kernel<64, 32, 16, 16, true, false, 0, 128><<<grid, MMB_NT, 0, stream>>>(W, X, D, M, K, T);
++            else              mmb_f32split_kernel<64, 32, 16, 16, true, false><<<grid, MMB_NT, 0, stream>>>(W, X, D, M, K, T);
+         } else if (M <= 64 && FS == 1) {
+             dim3 grid((M + 63) / 64, (T + 63) / 64);
+             mmb_f32split_kernel<64, 64, 16, 32, true, false><<<grid, MMB_NT, 0, stream>>>(W, X, D, M, K, T);
+@@ -1346,6 +1360,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+             mmb_f32split_kernel<64, 128, 16, 64, true, false><<<grid, MMB_NT, 0, stream>>>(W, X, D, M, K, T);
+         } else if (FT == 1) { dim3 g((M + 63) / 64,  (T + 127) / 128); mmb_f32split_kernel< 64, 128, 32, 32, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
+         else if (FT == 4)   { dim3 g((M + 31) / 32,  (T + 127) / 128); mmb_f32split_kernel< 32, 128, 32, 16, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
++        else if (FT == 5 && K % 128 == 0) { dim3 g((M + 127) / 128, (T + 63) / 64); mmb_f32split_kernel<128, 64, 32, 32, true, false, 0, 128><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
+         else if (FT == 5)   { dim3 g((M + 31) / 32,  (T + 63) / 64);   mmb_f32split_kernel< 32,  64, 16, 16, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
+         else if (FT == 6)   { dim3 g((M + 63) / 64,  (T + 63) / 64);   mmb_f32split_kernel< 64,  64, 32, 16, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
+         else                { dim3 g((M + 127) / 128,(T + 127) / 128); mmb_f32split_kernel<128, 128, 32, 64, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T);
+@@ -1435,7 +1450,9 @@ bool ggml_cuda_mmb_f32_dual(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     }
+     const int M = M1 + M2;
+     dim3 grid((M + 63) / 64, (T + 31) / 32);
+-    mmb_f32split_kernel<64, 32, 16, 16, true, false><<<grid, MMB_NT, 0, ctx.stream()>>>((const float *) w1->data, (const float *) x->data,
++    if (K % 128 == 0) mmb_f32split_kernel<64, 32, 16, 16, true, false, 0, 128><<<grid, MMB_NT, 0, ctx.stream()>>>((const float *) w1->data,
++        (const float *) x->data, (float *) d1->data, M, K, T, (const float *) w2->data, (float *) d2->data, M1);
++    else mmb_f32split_kernel<64, 32, 16, 16, true, false><<<grid, MMB_NT, 0, ctx.stream()>>>((const float *) w1->data, (const float *) x->data,
+         (float *) d1->data, M, K, T, (const float *) w2->data, (float *) d2->data, M1);
+     CUDA_CHECK(cudaGetLastError());
+     return true;

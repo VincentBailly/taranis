@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="1320" viewBox="0 0 720 1320" role="img" aria-labelledby="title desc">
+<title id="title">Strix Halo benchmark results</title>
+<desc id="desc">Vertical bars compare Taranis, Halogen, Strata, strix-llama.cpp Vulkan and stock llama.cpp. Taranis was measured on 2026-11-02; other engines on 2026-10-31. All axes start at zero.</desc>
+<rect width="720" height="1320" fill="white"/>
+<style>text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; } .axis { font-size: 15px; fill: #64748b; } .engine { font-size: 17px; } .version { font-size: 14px; fill: #64748b; }</style>
+<g transform="translate(0 0)">
+<text x="20" y="35" font-size="23" font-weight="600">Decode (tokens/s)</text>
+<text x="700" y="35" text-anchor="end" font-size="15" fill="#64748b">Higher is better</text>
+<line x1="68" x2="700" y1="252" y2="252" stroke="#94a3b8"/>
+<text class="axis" x="58" y="257" text-anchor="end">0</text>
+<line x1="68" x2="700" y1="207" y2="207" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="212" text-anchor="end">20</text>
+<line x1="68" x2="700" y1="162" y2="162" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="167" text-anchor="end">40</text>
+<line x1="68" x2="700" y1="117" y2="117" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="122" text-anchor="end">60</text>
+<line x1="68" x2="700" y1="72" y2="72" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="77" text-anchor="end">80</text>
+<rect x="97.19999999999999" y="124.98323476023377" width="68" height="127.01676523976623" fill="#2563eb"/>
+<text x="131.2" y="114.98323476023377" text-anchor="middle" font-size="21" font-weight="600" style="fill:#2563eb">56.5</text>
+<text class="engine" x="131.2" y="282" text-anchor="middle" font-weight="600">Taranis</text>
+<text class="version" x="131.2" y="303" text-anchor="middle"></text>
+<rect x="223.60000000000002" y="149.1381754857424" width="68" height="102.86182451425759" fill="#94a3b8"/>
+<text x="257.6" y="139.1381754857424" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">45.7</text>
+<text class="engine" x="257.6" y="282" text-anchor="middle" font-weight="400">Halogen</text>
+<text class="version" x="257.6" y="303" text-anchor="middle">0.18.21</text>
+<rect x="350" y="176.01566348985608" width="68" height="75.9843365101439" fill="#94a3b8"/>
+<text x="384" y="166.01566348985608" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">33.8</text>
+<text class="engine" x="384" y="282" text-anchor="middle" font-weight="400">Strata</text>
+<text class="version" x="384" y="303" text-anchor="middle">0.2.9</text>
+<rect x="476.4" y="175.69126923097028" width="68" height="76.30873076902972" fill="#94a3b8"/>
+<text x="510.4" y="165.69126923097028" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">33.9</text>
+<text class="engine" x="510.4" y="282" text-anchor="middle" font-weight="400">strix-llama.cpp</text>
+<text class="version" x="510.4" y="303" text-anchor="middle">b1038 / Vulkan</text>
+<rect x="602.8" y="184.96250405987553" width="68" height="67.03749594012446" fill="#94a3b8"/>
+<text x="636.8" y="174.96250405987553" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">29.8</text>
+<text class="engine" x="636.8" y="282" text-anchor="middle" font-weight="400">llama.cpp</text>
+<text class="version" x="636.8" y="303" text-anchor="middle">stock</text>
+</g>
+<g transform="translate(0 330)">
+<text x="20" y="35" font-size="23" font-weight="600">Prefill (tokens/s)</text>
+<text x="700" y="35" text-anchor="end" font-size="15" fill="#64748b">Higher is better</text>
+<line x1="68" x2="700" y1="252" y2="252" stroke="#94a3b8"/>
+<text class="axis" x="58" y="257" text-anchor="end">0</text>
+<line x1="68" x2="700" y1="192" y2="192" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="197" text-anchor="end">500</text>
+<line x1="68" x2="700" y1="132" y2="132" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="137" text-anchor="end">1,000</text>
+<line x1="68" x2="700" y1="72" y2="72" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="77" text-anchor="end">1,500</text>
+<rect x="97.19999999999999" y="103.13093469655527" width="68" height="148.86906530344473" fill="#2563eb"/>
+<text x="131.2" y="93.13093469655527" text-anchor="middle" font-size="21" font-weight="600" style="fill:#2563eb">1,241</text>
+<text class="engine" x="131.2" y="282" text-anchor="middle" font-weight="600">Taranis</text>
+<text class="version" x="131.2" y="303" text-anchor="middle"></text>
+<rect x="223.60000000000002" y="98.64535310992648" width="68" height="153.35464689007352" fill="#94a3b8"/>
+<text x="257.6" y="88.64535310992648" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">1,278</text>
+<text class="engine" x="257.6" y="282" text-anchor="middle" font-weight="400">Halogen</text>
+<text class="version" x="257.6" y="303" text-anchor="middle">0.18.21</text>
+<rect x="350" y="191.5229912789671" width="68" height="60.47700872103288" fill="#94a3b8"/>
+<text x="384" y="181.5229912789671" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">504</text>
+<text class="engine" x="384" y="282" text-anchor="middle" font-weight="400">Strata</text>
+<text class="version" x="384" y="303" text-anchor="middle">0.2.9</text>
+<rect x="476.4" y="168.2851290821141" width="68" height="83.7148709178859" fill="#94a3b8"/>
+<text x="510.4" y="158.2851290821141" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">698</text>
+<text class="engine" x="510.4" y="282" text-anchor="middle" font-weight="400">strix-llama.cpp</text>
+<text class="version" x="510.4" y="303" text-anchor="middle">b1038 / Vulkan</text>
+<rect x="602.8" y="196.3063647960473" width="68" height="55.69363520395272" fill="#94a3b8"/>
+<text x="636.8" y="186.3063647960473" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">464</text>
+<text class="engine" x="636.8" y="282" text-anchor="middle" font-weight="400">llama.cpp</text>
+<text class="version" x="636.8" y="303" text-anchor="middle">stock</text>
+</g>
+<g transform="translate(0 660)">
+<text x="20" y="35" font-size="23" font-weight="600">8K first token (s)</text>
+<text x="700" y="35" text-anchor="end" font-size="15" fill="#64748b">Lower is better</text>
+<line x1="68" x2="700" y1="252" y2="252" stroke="#94a3b8"/>
+<text class="axis" x="58" y="257" text-anchor="end">0</text>
+<line x1="68" x2="700" y1="207" y2="207" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="212" text-anchor="end">5</text>
+<line x1="68" x2="700" y1="162" y2="162" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="167" text-anchor="end">10</text>
+<line x1="68" x2="700" y1="117" y2="117" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="122" text-anchor="end">15</text>
+<line x1="68" x2="700" y1="72" y2="72" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="77" text-anchor="end">20</text>
+<rect x="97.19999999999999" y="200.8309541129999" width="68" height="51.16904588700009" fill="#2563eb"/>
+<text x="131.2" y="190.8309541129999" text-anchor="middle" font-size="21" font-weight="600" style="fill:#2563eb">5.69</text>
+<text class="engine" x="131.2" y="282" text-anchor="middle" font-weight="600">Taranis</text>
+<text class="version" x="131.2" y="303" text-anchor="middle"></text>
+<rect x="223.60000000000002" y="202.10349182399992" width="68" height="49.89650817600008" fill="#94a3b8"/>
+<text x="257.6" y="192.10349182399992" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">5.54</text>
+<text class="engine" x="257.6" y="282" text-anchor="middle" font-weight="400">Halogen</text>
+<text class="version" x="257.6" y="303" text-anchor="middle">0.18.21</text>
+<rect x="350" y="160.22911158000002" width="68" height="91.77088841999998" fill="#94a3b8"/>
+<text x="384" y="150.22911158000002" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">10.20</text>
+<text class="engine" x="384" y="282" text-anchor="middle" font-weight="400">Strata</text>
+<text class="version" x="384" y="303" text-anchor="middle">0.2.9</text>
+<rect x="476.4" y="156.24943131600014" width="68" height="95.75056868399987" fill="#94a3b8"/>
+<text x="510.4" y="146.24943131600014" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">10.64</text>
+<text class="engine" x="510.4" y="282" text-anchor="middle" font-weight="400">strix-llama.cpp</text>
+<text class="version" x="510.4" y="303" text-anchor="middle">b1038 / Vulkan</text>
+<rect x="602.8" y="98.57182476600008" width="68" height="153.42817523399992" fill="#94a3b8"/>
+<text x="636.8" y="88.57182476600008" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">17.05</text>
+<text class="engine" x="636.8" y="282" text-anchor="middle" font-weight="400">llama.cpp</text>
+<text class="version" x="636.8" y="303" text-anchor="middle">stock</text>
+</g>
+<g transform="translate(0 990)">
+<text x="20" y="35" font-size="23" font-weight="600">15-request time (s)</text>
+<text x="700" y="35" text-anchor="end" font-size="15" fill="#64748b">Lower is better</text>
+<line x1="68" x2="700" y1="252" y2="252" stroke="#94a3b8"/>
+<text class="axis" x="58" y="257" text-anchor="end">0</text>
+<line x1="68" x2="700" y1="192" y2="192" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="197" text-anchor="end">100</text>
+<line x1="68" x2="700" y1="132" y2="132" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="137" text-anchor="end">200</text>
+<line x1="68" x2="700" y1="72" y2="72" stroke="#e2e8f0"/>
+<text class="axis" x="58" y="77" text-anchor="end">300</text>
+<rect x="97.19999999999999" y="194.70818141819998" width="68" height="57.29181858180001" fill="#2563eb"/>
+<text x="131.2" y="184.70818141819998" text-anchor="middle" font-size="21" font-weight="600" style="fill:#2563eb">95.5</text>
+<text class="engine" x="131.2" y="282" text-anchor="middle" font-weight="600">Taranis</text>
+<text class="version" x="131.2" y="303" text-anchor="middle"></text>
+<rect x="223.60000000000002" y="185.6213612052" width="68" height="66.37863879480001" fill="#94a3b8"/>
+<text x="257.6" y="175.6213612052" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">110.6</text>
+<text class="engine" x="257.6" y="282" text-anchor="middle" font-weight="400">Halogen</text>
+<text class="version" x="257.6" y="303" text-anchor="middle">0.18.21</text>
+<rect x="350" y="142.80981007260004" width="68" height="109.19018992739997" fill="#94a3b8"/>
+<text x="384" y="132.80981007260004" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">182.0</text>
+<text class="engine" x="384" y="282" text-anchor="middle" font-weight="400">Strata</text>
+<text class="version" x="384" y="303" text-anchor="middle">0.2.9</text>
+<rect x="476.4" y="154.79669522400002" width="68" height="97.20330477599998" fill="#94a3b8"/>
+<text x="510.4" y="144.79669522400002" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">162.0</text>
+<text class="engine" x="510.4" y="282" text-anchor="middle" font-weight="400">strix-llama.cpp</text>
+<text class="version" x="510.4" y="303" text-anchor="middle">b1038 / Vulkan</text>
+<rect x="602.8" y="130.5954104892" width="68" height="121.4045895108" fill="#94a3b8"/>
+<text x="636.8" y="120.59541048919999" text-anchor="middle" font-size="21" font-weight="600" style="fill:#334155">202.3</text>
+<text class="engine" x="636.8" y="282" text-anchor="middle" font-weight="400">llama.cpp</text>
+<text class="version" x="636.8" y="303" text-anchor="middle">stock</text>
+</g>
+</svg>

@@ -8,7 +8,7 @@ model files against the hashes in metadata. Start one engine at a time.
 The **2026-10-31** comparison results use Halogen **0.18.21**, Strata
 app **0.2.9** / engine **0.1.55**, strix-llama.cpp **b1038 / Vulkan** and
 stock llama.cpp **0ec4027** on both platforms. Taranis results were refreshed
-on **2026-11-01** with **40 patches**.
+on **2026-11-02** with **42 patches**.
 See [Strix Halo metadata](strix-halo-metadata.json) and
 [Gorgon Halo metadata](gorgon-halo-metadata.json) for pins and hashes.
 

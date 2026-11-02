@@ -12,31 +12,23 @@ you bring the weights. Choose compatible GGUF model files and, for MTP, a GGUF
 draft from a source you trust. Taranis requires no private checkpoint or
 publisher-only draft head.
 
-In our synthetic MTP tests, Taranis delivered **86% faster decode than stock
-llama.cpp on Strix Halo** and **73% faster decode on Gorgon Halo**.
-Taranis was rerun on 2026-11-01; the other results are from 2026-10-31.
+In our synthetic MTP tests, Taranis delivered **89% faster decode than stock
+llama.cpp on Strix Halo** and **75% faster decode on Gorgon Halo**.
+Taranis was rerun on 2026-11-02; the other results are from 2026-10-31.
 
 ## Speed you can check
 
-Gorgon Halo: Ryzen AI Max+ PRO 495 / Radeon 8065S, 192 GiB RAM.
+### Gorgon Halo
 
-| Engine | Decode (tok/s) | Prefill (tok/s) | 8K first token (s) | 15-request time (s) |
-|---|---:|---:|---:|---:|
-| Taranis | 63.4 | 1,511 | 4.67 | 83.1 |
-| Halogen 0.18.21 | 50.7 | 1,527 | 4.62 | 97.9 |
-| Strata 0.2.9 | 51.3 | 629 | 8.13 | 129.6 |
-| strix-llama.cpp b1038 (Vulkan) | 36.4 | 831 | 8.76 | 146.5 |
-| Stock llama.cpp | 36.6 | 543 | 14.72 | 167.8 |
+Ryzen AI Max+ PRO 495 / Radeon 8065S, 192 GiB RAM.
 
-Strix Halo: Ryzen AI Max+ 395 / Radeon 8060S, 128 GiB RAM.
+![Gorgon Halo: vertical bar charts for decode, prefill, first-token time and total request time](assets/gorgon-halo-benchmarks.svg)
 
-| Engine | Decode (tok/s) | Prefill (tok/s) | 8K first token (s) | 15-request time (s) |
-|---|---:|---:|---:|---:|
-| Taranis | 55.4 | 1,238 | 5.72 | 96.8 |
-| Halogen 0.18.21 | 45.7 | 1,278 | 5.54 | 110.6 |
-| Strata 0.2.9 | 33.8 | 504 | 10.20 | 182.0 |
-| strix-llama.cpp b1038 (Vulkan) | 33.9 | 698 | 10.64 | 162.0 |
-| Stock llama.cpp | 29.8 | 464 | 17.05 | 202.3 |
+### Strix Halo
+
+Ryzen AI Max+ 395 / Radeon 8060S, 128 GiB RAM.
+
+![Strix Halo: vertical bar charts for decode, prefill, first-token time and total request time](assets/strix-halo-benchmarks.svg)
 
 All engines used MTP and the same verified main GGUF source files, with their
 own precision and draft settings. strix-llama.cpp used its recommended Vulkan

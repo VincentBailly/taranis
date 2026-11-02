@@ -60,7 +60,7 @@
   "engines": {
     "taranis": {
       "llama_cpp": "da731374077f2ad9bdffd4848f782b5694b9bb68",
-      "patches": 40,
+      "patches": 42,
       "rocm_systems": "5bdc7e255d1a1a8b6319df3621380722485af8ec",
       "rocm_RPM": "10.0.0-4",
       "kv": "f16",
@@ -74,9 +74,9 @@
       "threads": 8,
       "threads_batch": 8,
       "hip_retained_pm4": true,
-      "public_release": "d5e78cfa0c334bc1000bd0066e4f4e14e4ffa7e4",
+      "public_release": "592f03847c0fb1645112e284bf1a0d715f4435a9",
       "build": "Packaged public ROCm image; image/Dockerfile flags; runtime and build/startup verified on GPU host",
-      "image_id": "sha256:af651a282fa87bddabfd53ded493d0dc49673916bf1f450af41445ae4d218e77",
+      "image_id": "sha256:e7e8af9ca3ad916b2910e2b5a62543603bd3aa59592b9ffff5394436eab28967",
       "server_flags": [
         "-m",
         "/models/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
@@ -134,8 +134,8 @@
         "HSA_OVERRIDE_GFX_VERSION": "11.5.1",
         "DEBUG_HIP_GRAPH_PM4": "1"
       },
-      "image_config_digest": "sha256:daf0f64dc3a1e518b13c94dffb05f8547d3d8c0e6c226b433b837f6e20b3eee7",
-      "measured_date": "2026-11-01"
+      "image_config_digest": "sha256:97590a66d42f00c41c4593f77234c10e6f32f755fb92121be43fc5d546d52472",
+      "measured_date": "2026-11-02"
     },
     "halogen": {
       "version": "0.18.19",
@@ -363,11 +363,12 @@
       ],
       "measured_engines": 5,
       "taranis_refresh": {
-        "date": "2026-11-01",
-        "source_commit": "d5e78cfa0c334bc1000bd0066e4f4e14e4ffa7e4",
+        "date": "2026-11-02",
+        "source_commit": "592f03847c0fb1645112e284bf1a0d715f4435a9",
         "warmup_requests": 5,
         "measured_requests": 15,
-        "other_results_date": "2026-10-31"
+        "other_results_date": "2026-10-31",
+        "kernel": "Linux 6.18.60"
       }
     },
     "strix_halo": {
@@ -399,14 +400,15 @@
       "date": "2026-10-31",
       "status": "Earlier four-engine run; latest-version update pending",
       "taranis_refresh": {
-        "date": "2026-11-01",
-        "source_commit": "d5e78cfa0c334bc1000bd0066e4f4e14e4ffa7e4",
+        "date": "2026-11-02",
+        "source_commit": "592f03847c0fb1645112e284bf1a0d715f4435a9",
         "warmup_requests": 5,
         "measured_requests": 15,
-        "other_results_date": "2026-10-31"
+        "other_results_date": "2026-10-31",
+        "kernel": "Linux 7.0.0-38-generic"
       }
     }
   },
   "scope": "Configured engine stacks using the same verified main GGUF inputs; native precision, runtime and MTP settings differ. Capped synthetic response speed; output quality has not been compared.",
-  "engine_settings_scope": "Top-level Taranis settings describe the 2026-11-01 refresh on both platforms. Other top-level engine settings describe earlier runs; platform metadata records their measured versions and settings."
+  "engine_settings_scope": "Top-level Taranis settings describe the 2026-11-02 refresh on both platforms. Other top-level engine settings describe earlier runs; platform metadata records their measured versions and settings."
 }

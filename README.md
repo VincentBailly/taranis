@@ -22,13 +22,13 @@ Taranis was rerun on 2026-11-02; the other results are from 2026-10-31.
 
 Ryzen AI Max+ PRO 495 / Radeon 8065S, 192 GiB RAM.
 
-![Gorgon Halo: vertical bar charts for decode, prefill, first-token time and total request time](assets/gorgon-halo-benchmarks-09ccd9849096.svg)
+![Gorgon Halo: vertical bar charts for decode, prefill, first-token time and total request time](assets/gorgon-halo-benchmarks-f04cddf1e7e4.svg)
 
 ### Strix Halo
 
 Ryzen AI Max+ 395 / Radeon 8060S, 128 GiB RAM.
 
-![Strix Halo: vertical bar charts for decode, prefill, first-token time and total request time](assets/strix-halo-benchmarks-0bfb1cacacfc.svg)
+![Strix Halo: vertical bar charts for decode, prefill, first-token time and total request time](assets/strix-halo-benchmarks-9c84b1448f2f.svg)
 
 All engines used MTP and the same verified main GGUF source files, with their
 own precision and draft settings. strix-llama.cpp used its recommended Vulkan

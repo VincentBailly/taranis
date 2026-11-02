@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="540" viewBox="0 0 1120 540" role="img" aria-labelledby="title desc">
+<title id="title">Strix Halo benchmark results</title>
+<desc id="desc">Four vertical bar charts compare Taranis, Halogen, Strata, strix-llama.cpp Vulkan and stock llama.cpp. Taranis was measured on 2026-11-02; other engines on 2026-10-31. All axes start at zero.</desc>
+<style>:root { --panel-top: #ffffff; --panel-bottom: #f6f9fd; --border: #dce5f0; --text: #23344b; --muted: #596c84; --grid: #e4ebf4; --baseline: #bac9dc; --accent-top: #0ea5e9; --accent-bottom: #2563eb; --accent-text: #0369a1; --bar-top: #8ca0ba; --bar-bottom: #738ba8; }
+@media (prefers-color-scheme: dark) { :root { --panel-top: #162133; --panel-bottom: #111b2b; --border: #2b3d56; --text: #e6eefb; --muted: #a4b5cd; --grid: #293950; --baseline: #526984; --accent-top: #67e8f9; --accent-bottom: #3b82f6; --accent-text: #7dd3fc; --bar-top: #7b94b3; --bar-bottom: #56718f; } }
+text { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: var(--text); }
+.heading { font-size: 22px; font-weight: 650; letter-spacing: -.3px; }
+.caption { font-size: 12px; fill: var(--muted); }
+.tick { font-size: 11px; fill: var(--muted); }
+.value { font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.engine { font-size: 13.5px; font-weight: 500; }
+.highlight { fill: var(--accent-text); font-weight: 750; }
+.versions { font-size: 11.5px; fill: var(--muted); }
+.panel { fill: url(#panel); stroke: var(--border); }
+.grid { stroke: var(--grid); }
+.baseline { stroke: var(--baseline); }</style>
+<defs>
+<linearGradient id="panel" x2="0" y2="1"><stop style="stop-color:var(--panel-top)"/><stop offset="1" style="stop-color:var(--panel-bottom)"/></linearGradient>
+<linearGradient id="accent" x2="0" y2="1"><stop style="stop-color:var(--accent-top)"/><stop offset="1" style="stop-color:var(--accent-bottom)"/></linearGradient>
+<linearGradient id="other" x2="0" y2="1"><stop style="stop-color:var(--bar-top)"/><stop offset="1" style="stop-color:var(--bar-bottom)"/></linearGradient>
+</defs>
+<g transform="translate(0 0)">
+<rect class="panel" x=".5" y=".5" width="547" height="241" rx="14"/>
+<text class="heading" x="20" y="30">Decode</text>
+<text class="caption" x="20" y="49">tokens/s</text>
+<text class="caption" x="528" y="30" text-anchor="end">Higher is better</text>
+<line class="baseline" x1="52" x2="530" y1="188" y2="188"/>
+<text class="tick" x="43" y="192" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="530" y1="159.5" y2="159.5"/>
+<text class="tick" x="43" y="163.5" text-anchor="end">20</text>
+<line class="grid" x1="52" x2="530" y1="131" y2="131"/>
+<text class="tick" x="43" y="135" text-anchor="end">40</text>
+<line class="grid" x1="52" x2="530" y1="102.5" y2="102.5"/>
+<text class="tick" x="43" y="106.5" text-anchor="end">60</text>
+<line class="grid" x1="52" x2="530" y1="74" y2="74"/>
+<text class="tick" x="43" y="78" text-anchor="end">80</text>
+<path d="M 75.8 188 V 112.556 Q 75.8 107.556 80.8 107.556 H 118.8 Q 123.8 107.556 123.8 112.556 V 188 Z" fill="url(#accent)"/>
+<text class="value highlight" x="99.8" y="99.556" text-anchor="middle">56.5</text>
+<text class="engine highlight" x="99.8" y="214" text-anchor="middle">Taranis</text>
+<path d="M 171.4 188 V 127.854 Q 171.4 122.854 176.4 122.854 H 214.4 Q 219.4 122.854 219.4 127.854 V 188 Z" fill="url(#other)"/>
+<text class="value" x="195.4" y="114.854" text-anchor="middle">45.7</text>
+<text class="engine" x="195.4" y="214" text-anchor="middle">Halogen</text>
+<path d="M 267 188 V 144.877 Q 267 139.877 272 139.877 H 310 Q 315 139.877 315 144.877 V 188 Z" fill="url(#other)"/>
+<text class="value" x="291" y="131.877" text-anchor="middle">33.8</text>
+<text class="engine" x="291" y="214" text-anchor="middle">Strata</text>
+<path d="M 362.6 188 V 144.671 Q 362.6 139.671 367.6 139.671 H 405.6 Q 410.6 139.671 410.6 144.671 V 188 Z" fill="url(#other)"/>
+<text class="value" x="386.6" y="131.671" text-anchor="middle">33.9</text>
+<text class="engine" x="386.6" y="214" text-anchor="middle">strix-llama.cpp</text>
+<path d="M 458.2 188 V 150.543 Q 458.2 145.543 463.2 145.543 H 501.2 Q 506.2 145.543 506.2 150.543 V 188 Z" fill="url(#other)"/>
+<text class="value" x="482.2" y="137.543" text-anchor="middle">29.8</text>
+<text class="engine" x="482.2" y="214" text-anchor="middle">llama.cpp</text>
+</g>
+<g transform="translate(572 0)">
+<rect class="panel" x=".5" y=".5" width="547" height="241" rx="14"/>
+<text class="heading" x="20" y="30">Prefill</text>
+<text class="caption" x="20" y="49">tokens/s</text>
+<text class="caption" x="528" y="30" text-anchor="end">Higher is better</text>
+<line class="baseline" x1="52" x2="530" y1="188" y2="188"/>
+<text class="tick" x="43" y="192" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="530" y1="150" y2="150"/>
+<text class="tick" x="43" y="154" text-anchor="end">500</text>
+<line class="grid" x1="52" x2="530" y1="112" y2="112"/>
+<text class="tick" x="43" y="116" text-anchor="end">1,000</text>
+<line class="grid" x1="52" x2="530" y1="74" y2="74"/>
+<text class="tick" x="43" y="78" text-anchor="end">1,500</text>
+<path d="M 75.8 188 V 98.716 Q 75.8 93.716 80.8 93.716 H 118.8 Q 123.8 93.716 123.8 98.716 V 188 Z" fill="url(#accent)"/>
+<text class="value highlight" x="99.8" y="85.716" text-anchor="middle">1,241</text>
+<text class="engine highlight" x="99.8" y="214" text-anchor="middle">Taranis</text>
+<path d="M 171.4 188 V 95.875 Q 171.4 90.875 176.4 90.875 H 214.4 Q 219.4 90.875 219.4 95.875 V 188 Z" fill="url(#other)"/>
+<text class="value" x="195.4" y="82.875" text-anchor="middle">1,278</text>
+<text class="engine" x="195.4" y="214" text-anchor="middle">Halogen</text>
+<path d="M 267 188 V 154.698 Q 267 149.698 272 149.698 H 310 Q 315 149.698 315 154.698 V 188 Z" fill="url(#other)"/>
+<text class="value" x="291" y="141.698" text-anchor="middle">504</text>
+<text class="engine" x="291" y="214" text-anchor="middle">Strata</text>
+<path d="M 362.6 188 V 139.981 Q 362.6 134.981 367.6 134.981 H 405.6 Q 410.6 134.981 410.6 139.981 V 188 Z" fill="url(#other)"/>
+<text class="value" x="386.6" y="126.981" text-anchor="middle">698</text>
+<text class="engine" x="386.6" y="214" text-anchor="middle">strix-llama.cpp</text>
+<path d="M 458.2 188 V 157.727 Q 458.2 152.727 463.2 152.727 H 501.2 Q 506.2 152.727 506.2 157.727 V 188 Z" fill="url(#other)"/>
+<text class="value" x="482.2" y="144.727" text-anchor="middle">464</text>
+<text class="engine" x="482.2" y="214" text-anchor="middle">llama.cpp</text>
+</g>
+<g transform="translate(0 258)">
+<rect class="panel" x=".5" y=".5" width="547" height="241" rx="14"/>
+<text class="heading" x="20" y="30">8K first token</text>
+<text class="caption" x="20" y="49">seconds</text>
+<text class="caption" x="528" y="30" text-anchor="end">Lower is better</text>
+<line class="baseline" x1="52" x2="530" y1="188" y2="188"/>
+<text class="tick" x="43" y="192" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="530" y1="159.5" y2="159.5"/>
+<text class="tick" x="43" y="163.5" text-anchor="end">5</text>
+<line class="grid" x1="52" x2="530" y1="131" y2="131"/>
+<text class="tick" x="43" y="135" text-anchor="end">10</text>
+<line class="grid" x1="52" x2="530" y1="102.5" y2="102.5"/>
+<text class="tick" x="43" y="106.5" text-anchor="end">15</text>
+<line class="grid" x1="52" x2="530" y1="74" y2="74"/>
+<text class="tick" x="43" y="78" text-anchor="end">20</text>
+<path d="M 75.8 188 V 160.593 Q 75.8 155.593 80.8 155.593 H 118.8 Q 123.8 155.593 123.8 160.593 V 188 Z" fill="url(#accent)"/>
+<text class="value highlight" x="99.8" y="147.593" text-anchor="middle">5.69</text>
+<text class="engine highlight" x="99.8" y="214" text-anchor="middle">Taranis</text>
+<path d="M 171.4 188 V 161.399 Q 171.4 156.399 176.4 156.399 H 214.4 Q 219.4 156.399 219.4 161.399 V 188 Z" fill="url(#other)"/>
+<text class="value" x="195.4" y="148.399" text-anchor="middle">5.54</text>
+<text class="engine" x="195.4" y="214" text-anchor="middle">Halogen</text>
+<path d="M 267 188 V 134.878 Q 267 129.878 272 129.878 H 310 Q 315 129.878 315 134.878 V 188 Z" fill="url(#other)"/>
+<text class="value" x="291" y="121.878" text-anchor="middle">10.20</text>
+<text class="engine" x="291" y="214" text-anchor="middle">Strata</text>
+<path d="M 362.6 188 V 132.358 Q 362.6 127.358 367.6 127.358 H 405.6 Q 410.6 127.358 410.6 132.358 V 188 Z" fill="url(#other)"/>
+<text class="value" x="386.6" y="119.358" text-anchor="middle">10.64</text>
+<text class="engine" x="386.6" y="214" text-anchor="middle">strix-llama.cpp</text>
+<path d="M 458.2 188 V 95.829 Q 458.2 90.829 463.2 90.829 H 501.2 Q 506.2 90.829 506.2 95.829 V 188 Z" fill="url(#other)"/>
+<text class="value" x="482.2" y="82.829" text-anchor="middle">17.05</text>
+<text class="engine" x="482.2" y="214" text-anchor="middle">llama.cpp</text>
+</g>
+<g transform="translate(572 258)">
+<rect class="panel" x=".5" y=".5" width="547" height="241" rx="14"/>
+<text class="heading" x="20" y="30">15-request time</text>
+<text class="caption" x="20" y="49">seconds</text>
+<text class="caption" x="528" y="30" text-anchor="end">Lower is better</text>
+<line class="baseline" x1="52" x2="530" y1="188" y2="188"/>
+<text class="tick" x="43" y="192" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="530" y1="150" y2="150"/>
+<text class="tick" x="43" y="154" text-anchor="end">100</text>
+<line class="grid" x1="52" x2="530" y1="112" y2="112"/>
+<text class="tick" x="43" y="116" text-anchor="end">200</text>
+<line class="grid" x1="52" x2="530" y1="74" y2="74"/>
+<text class="tick" x="43" y="78" text-anchor="end">300</text>
+<path d="M 75.8 188 V 156.715 Q 75.8 151.715 80.8 151.715 H 118.8 Q 123.8 151.715 123.8 156.715 V 188 Z" fill="url(#accent)"/>
+<text class="value highlight" x="99.8" y="143.715" text-anchor="middle">95.5</text>
+<text class="engine highlight" x="99.8" y="214" text-anchor="middle">Taranis</text>
+<path d="M 171.4 188 V 150.96 Q 171.4 145.96 176.4 145.96 H 214.4 Q 219.4 145.96 219.4 150.96 V 188 Z" fill="url(#other)"/>
+<text class="value" x="195.4" y="137.96" text-anchor="middle">110.6</text>
+<text class="engine" x="195.4" y="214" text-anchor="middle">Halogen</text>
+<path d="M 267 188 V 123.846 Q 267 118.846 272 118.846 H 310 Q 315 118.846 315 123.846 V 188 Z" fill="url(#other)"/>
+<text class="value" x="291" y="110.846" text-anchor="middle">182.0</text>
+<text class="engine" x="291" y="214" text-anchor="middle">Strata</text>
+<path d="M 362.6 188 V 131.438 Q 362.6 126.438 367.6 126.438 H 405.6 Q 410.6 126.438 410.6 131.438 V 188 Z" fill="url(#other)"/>
+<text class="value" x="386.6" y="118.438" text-anchor="middle">162.0</text>
+<text class="engine" x="386.6" y="214" text-anchor="middle">strix-llama.cpp</text>
+<path d="M 458.2 188 V 116.11 Q 458.2 111.11 463.2 111.11 H 501.2 Q 506.2 111.11 506.2 116.11 V 188 Z" fill="url(#other)"/>
+<text class="value" x="482.2" y="103.11" text-anchor="middle">202.3</text>
+<text class="engine" x="482.2" y="214" text-anchor="middle">llama.cpp</text>
+</g>
+<text class="versions" x="560" y="526" text-anchor="middle">Halogen 0.18.21 · Strata 0.2.9 · strix-llama.cpp b1038 / Vulkan · stock llama.cpp</text>
+</svg>

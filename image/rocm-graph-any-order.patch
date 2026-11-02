@@ -1,0 +1,105 @@
+diff --git a/projects/clr/hipamd/src/hip_graph.cpp b/projects/clr/hipamd/src/hip_graph.cpp
+index 0e24c20..4ef033a 100644
+--- a/projects/clr/hipamd/src/hip_graph.cpp
++++ b/projects/clr/hipamd/src/hip_graph.cpp
+@@ -74,9 +74,21 @@ inline hipMemcpy3DParms ihipLinearAsMemcpy3DParms(void* dst, const void* src, si
+   return params;
+ }
+ 
++// If the next node captured on this thread is a kernel launched with hipLaunchKernel, it does not
++// wait for the previous dispatches (hipExtAnyOrderLaunch); the caller guarantees it is independent of them.
++static thread_local bool tls_next_launch_any_order = false;
++
++extern "C" __attribute__((visibility("default"))) hipError_t hipExtSetNextLaunchAnyOrder(int enable) {
++  tls_next_launch_any_order = enable != 0;
++  return hipSuccess;
++}
++
+ inline hipError_t ihipGraphAddNode(hip::GraphNode* graphNode, hip::Graph* graph,
+                                    hip::GraphNode* const* pDependencies, size_t numDependencies,
+                                    bool capture, int devId) {
++  if (capture) {
++    tls_next_launch_any_order = false;
++  }
+   graph->AddNode(graphNode);
+   std::unordered_set<hip::GraphNode*> DuplicateDep;
+   for (size_t i = 0; i < numDependencies; i++) {
+@@ -295,9 +307,15 @@ hipError_t capturehipLaunchKernel(hipStream_t& stream, const void*& hostFunction
+   nodeParams.sharedMemBytes = sharedMemBytes;
+ 
+   hip::GraphNode* pGraphNode;
++  uint32_t launchFlags = 0;
++  if (tls_next_launch_any_order) {
++    tls_next_launch_any_order = false;
++    launchFlags = hipExtAnyOrderLaunch;
++  }
+   hipError_t status = ihipGraphAddKernelNode(
+       &pGraphNode, s->GetCaptureGraph(), s->GetLastCapturedNodes().data(),
+-      s->GetLastCapturedNodes().size(), &nodeParams, nullptr, true, 0, s->DeviceId());
++      s->GetLastCapturedNodes().size(), &nodeParams, nullptr, true, 0, s->DeviceId(), 0, 0, 0,
++      {1, 1, 1}, launchFlags);
+   if (status != hipSuccess) {
+     return status;
+   }
+diff --git a/projects/clr/hipamd/src/hip_hcc.map.in b/projects/clr/hipamd/src/hip_hcc.map.in
+index 7299b28..6045121 100644
+--- a/projects/clr/hipamd/src/hip_hcc.map.in
++++ b/projects/clr/hipamd/src/hip_hcc.map.in
+@@ -705,6 +705,7 @@ local:
+ hip_7.18 {
+ global:
+     hipDeviceFlushGPUDirectRDMAWrites;
++    hipExtSetNextLaunchAnyOrder;
+ local:
+     *;
+ } hip_7.17;
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+index f63f37b..9c4cbb7 100644
+--- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
++++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+@@ -1783,6 +1783,11 @@ std::shared_ptr<amd::device::GraphPm4Batch> VirtualGPU::CreateGraphPm4Batch(
+     if (type != HSA_PACKET_TYPE_KERNEL_DISPATCH) {
+       return nullptr;
+     }
++    // A dispatch captured without the AQL barrier bit (hipExtAnyOrderLaunch) does not
++    // wait for the previous dispatches and may overlap with them.
++    if (i > 0 && (header & (1u << HSA_PACKET_HEADER_BARRIER)) == 0) {
++      dependencies[i - 1] = static_cast<hsa_ven_amd_graph_dependency_t>(2);
++    }
+     std::memcpy(&packets[i],
+                 flatPacketData.data() + i * sizeof(hsa_kernel_dispatch_packet_t),
+                 sizeof(hsa_kernel_dispatch_packet_t));
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_graph_command_encoder.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_graph_command_encoder.h
+index 4eebac8..d48dab8 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_graph_command_encoder.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_graph_command_encoder.h
+@@ -76,6 +76,8 @@ class Gfx11CommandEncoder {
+     if (dispatch_count_ != 0) {
+       if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_SAME_AGENT_RMW) {
+         DependencyRmwSameAgent();
++      } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_NONE) {
++        // independent of the previous dispatches: no wait, may overlap
+       } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_VMEM_ONLY &&
+                  (kernel_flags & HSA_VEN_AMD_GRAPH_KERNEL_VERIFIED_VMEM_ONLY) != 0) {
+         DependencyRmwVmem();
+@@ -273,6 +275,8 @@ class Gfx12CommandEncoder {
+     if (dispatch_count_ != 0) {
+       if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_SAME_AGENT_RMW) {
+         DependencyRmwSameAgent();
++      } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_NONE) {
++        // independent of the previous dispatches: no wait, may overlap
+       } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_VMEM_ONLY &&
+                  (kernel_flags & HSA_VEN_AMD_GRAPH_KERNEL_VERIFIED_VMEM_ONLY) != 0) {
+         DependencyRmwVmem();
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_ven_amd_graph.h b/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_ven_amd_graph.h
+index aface5b..ca38245 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_ven_amd_graph.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_ven_amd_graph.h
+@@ -43,6 +43,7 @@ typedef struct hsa_ven_amd_graph_capabilities_s {
+ typedef enum hsa_ven_amd_graph_dependency_s {
+   HSA_VEN_AMD_GRAPH_DEPENDENCY_SAME_AGENT_RMW = 0,
+   HSA_VEN_AMD_GRAPH_DEPENDENCY_VMEM_ONLY = 1,
++  HSA_VEN_AMD_GRAPH_DEPENDENCY_NONE = 2,
+ } hsa_ven_amd_graph_dependency_t;
+ 
+ typedef enum hsa_ven_amd_graph_kernel_flag_s {

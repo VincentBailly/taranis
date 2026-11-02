@@ -44,6 +44,10 @@ COPY image/requirements.txt /tmp/requirements.txt
 RUN python3 -m venv --system-site-packages /venv \
   && /venv/bin/pip install --no-cache-dir --no-build-isolation --require-hashes -r /tmp/requirements.txt
 
+COPY image/rocm-graph-any-order.patch /tmp/rocm-graph-any-order.patch
+RUN git -C /src/rocm apply --check /tmp/rocm-graph-any-order.patch \
+  && git -C /src/rocm apply /tmp/rocm-graph-any-order.patch
+
 RUN set -eux; export PATH=/venv/bin:$PATH; \
     cmake -S /src/rocm/projects/rocr-runtime -B /build/rocr -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX=/opt/taranis/rocr -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_PREFIX_PATH=$ROCM -DBUILD_SHARED_LIBS=ON; \

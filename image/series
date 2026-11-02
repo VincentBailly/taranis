@@ -39,3 +39,4 @@ prompt-q8-decode.patch
 mtp-ehproj-shared-half.patch
 moe-glu-wide-blocks.patch
 mmvf-f16-prefetch.patch
+any-order-launches.patch

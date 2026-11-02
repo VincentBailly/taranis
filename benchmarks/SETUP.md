@@ -14,7 +14,7 @@ See [Strix Halo metadata](strix-halo-metadata.json) and
 
 ## Taranis
 
-This packages llama.cpp `da731374077f2ad9bdffd4848f782b5694b9bb68` with 40
+This packages llama.cpp `da731374077f2ad9bdffd4848f782b5694b9bb68` with 42
 patches and the tuned ROCm `10.0.0-4` runtimes. The server flags match the
 measured configuration.
 

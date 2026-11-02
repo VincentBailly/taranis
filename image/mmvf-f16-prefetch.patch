@@ -1,0 +1,53 @@
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index ca10014..792b504 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -258,7 +258,37 @@ static __global__ void mul_mat_vec_f(
+             half2 sumh2[ncols_dst] = {{0.0f, 0.0f}};
+             half2 sumh2_gate[ncols_dst] = {{0.0f, 0.0f}};
+ 
+-            for (int col2 = tid; col2 < ncols2; col2 += block_size) {
++            int col2 = tid;
++#if defined(GGML_USE_HIP)
++            // whole chunks only, the rest below: with conditional tail loads the compiler converts each y load to half
++            // right after it and waits for every load
++            if constexpr (pfd > 0 && !has_fusion) {
++                for (; col2 + (pfd - 1)*block_size < ncols2; col2 += pfd*block_size) {
++                    half2  tmpx[pfd];
++                    float2 tmpy[pfd][ncols_dst];
++#pragma unroll
++                    for (int i = 0; i < pfd; ++i) {
++                        tmpx[i] = x2[col2 + i*block_size];
++                    }
++#pragma unroll
++                    for (int i = 0; i < pfd; ++i) {
++#pragma unroll
++                        for (int j = 0; j < ncols_dst; ++j) {
++                            tmpy[i][j] = y2[j*stride_col_y2 + col2 + i*block_size];
++                        }
++                    }
++#pragma unroll
++                    for (int i = 0; i < pfd; ++i) {
++#pragma unroll
++                        for (int j = 0; j < ncols_dst; ++j) {
++                            sumh2[j] += tmpx[i] * make_half2(tmpy[i][j].x, tmpy[i][j].y);
++                        }
++                    }
++                }
++            }
++#endif // defined(GGML_USE_HIP)
++
++            for (; col2 < ncols2; col2 += block_size) {
+                 const half2 tmpx = x2[col2];
+                 half2 tmpx_gate = make_half2(0.0f, 0.0f);
+                 if constexpr (has_fusion) {
+@@ -606,7 +636,8 @@ static void mul_mat_vec_f_switch_fusion(
+ #if defined(GGML_USE_HIP)
+     // a grid of fewer blocks than CUs (e.g. the hyper-connection inject and shared-expert gate projections of a
+     // decode batch) is latency bound: load deeper ahead, same accumulation order
+-    if constexpr ((std::is_same_v<T, float> || std::is_same_v<T, nv_bfloat16>) && ncols_dst <= 4 && block_size == 256 &&
++    if constexpr ((std::is_same_v<T, float> || std::is_same_v<T, nv_bfloat16> ||
++                   (std::is_same_v<T, half> && std::is_same_v<type_acc, half>)) && ncols_dst <= 4 && block_size == 256 &&
+                   !is_multi_token_id && !tokens_in_block) {
+         if ((int64_t) block_nums.x * block_nums.y * block_nums.z < ggml_cuda_info().devices[ggml_cuda_get_device()].nsm) {
+             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, false, 10>, launch_params,
